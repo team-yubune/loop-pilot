@@ -875,26 +875,6 @@ export async function runPostFix(
       return true;
     }
 
-    // Audit comment (best-effort): explain the /restart-review-free re-request.
-    try {
-      await deps.postComment(
-        config.repoOwner,
-        config.repoName,
-        config.prNumber,
-        "🔁 LoopPilot auto-retry: the base-tier repair hit `--max-turns`. " +
-          "Re-requesting `@codex review` and retrying once at the escalated tier " +
-          `(\`${config.claudeCodeModelEscalated}\`) — no \`/restart-review\` needed. ` +
-          "If the escalated attempt also exceeds `--max-turns`, the loop stops for manual follow-up.",
-        config.githubToken,
-      );
-    } catch (commentError) {
-      deps.warning(
-        `[post-fix] auto-retry-escalate: failed to post the audit comment (continuing): ${
-          commentError instanceof Error ? commentError.message : String(commentError)
-        }`,
-      );
-    }
-
     // Demote to a restartable stop when the re-request cannot reach Codex
     // (mirrors Phase 4 / TY-273 #B5). The reverted working tree means no commit
     // was made, so /restart-review cleanly retries the same findings.
@@ -967,12 +947,35 @@ export async function runPostFix(
       return true;
     }
 
+    // Audit comment (best-effort). Posted only AFTER `@codex review` actually
+    // went out, so a request failure above cannot leave an optimistic
+    // "retrying" comment contradicting the codex_request_failed stop.
+    try {
+      await deps.postComment(
+        config.repoOwner,
+        config.repoName,
+        config.prNumber,
+        "🔁 LoopPilot auto-retry: the base-tier repair hit `--max-turns`. " +
+          "Re-requested `@codex review` to retry once at the escalated tier " +
+          `(\`${config.claudeCodeModelEscalated}\`) — no \`/restart-review\` needed. ` +
+          "If the escalated attempt also exceeds `--max-turns`, the loop stops for manual follow-up.",
+        config.githubToken,
+      );
+    } catch (commentError) {
+      deps.warning(
+        `[post-fix] auto-retry-escalate: failed to post the audit comment (continuing): ${
+          commentError instanceof Error ? commentError.message : String(commentError)
+        }`,
+      );
+    }
+
     const withRequestId: ReviewState = {
       ...retryState,
       lastCodexRequestCommentId: reviewRequestId,
     };
+    let requestIdPersisted: boolean;
     try {
-      await updateStateCommentLocked(
+      requestIdPersisted = await updateStateCommentLocked(
         withRequestId,
         "Could not persist the auto-retry Codex review request comment id.",
         {
@@ -991,6 +994,12 @@ export async function runPostFix(
           recordError instanceof Error ? recordError.message : String(recordError)
         }. State remains waiting_codex; the next Codex trigger will reconcile.`,
       );
+      return true;
+    }
+    if (!requestIdPersisted) {
+      // 412 conflict: a concurrent run already advanced the state (e.g. the
+      // incoming Codex review drove a fresh pre-fix). Skip the ACK poll — the
+      // concurrent writer now owns the loop (mirrors Phase 4's guard).
       return true;
     }
 
@@ -1013,6 +1022,32 @@ export async function runPostFix(
         `Codex did not acknowledge the escalated auto-retry @codex review request after ${config.codexAckMaxReposts} repost(s) (≈${config.codexAckTimeoutSeconds}s per attempt). No commit was made; run /restart-review once Codex is reachable to retry at the escalated tier.`,
       );
       return true;
+    }
+
+    // If the ACK only arrived after a repost, record the latest @codex review
+    // comment id (mirrors Phase 4). Best-effort — the state is already
+    // waiting_codex — so a failure here is swallowed rather than demoting a
+    // healthy loop.
+    if (ack.reposts > 0 && ack.lastCommentId !== reviewRequestId) {
+      try {
+        await updateStateCommentLocked(
+          { ...withRequestId, lastCodexRequestCommentId: ack.lastCommentId },
+          "Could not persist the reposted auto-retry Codex review request id.",
+          {
+            onConflict: async (conflictDetail) => {
+              deps.warning(
+                `[post-fix] ${conflictDetail} LoopPilot state remains waiting_codex; the next Codex review trigger will reconcile.`,
+              );
+            },
+          },
+        );
+      } catch (repostWriteError) {
+        deps.warning(
+          `[post-fix] auto-retry-escalate: failed to persist the reposted review request id ${ack.lastCommentId}: ${
+            repostWriteError instanceof Error ? repostWriteError.message : String(repostWriteError)
+          }. State remains waiting_codex; the next Codex trigger will reconcile.`,
+        );
+      }
     }
 
     deps.info(

@@ -78,7 +78,7 @@ Repository variable `LOOPPILOT_AUTO_MERGE=true` を設定すると、`done / no_
 
 post-fix が repair commit を push した後に `@codex review` を投稿する API 呼び出しが失敗した場合 (rate limit / 認証エラー / network 障害)、`stopped/codex_request_failed` へ降格し、`postTerminalNotification` 経由で top-level コメントとして「Codex 再依頼に失敗したため停止」通知が PR に投稿される。repair commit 自体は branch に残るので、Codex の認証・接続を直してから `/restart-review` (soft) で再開すれば良い。`iterationCount` / `findingsHashHistory` は次 iteration が同じ findings を再評価できるよう保持される。
 
-検知ロジック: `src/main-post-fix.ts` の Phase 4 にある `postCodexReviewRequest` catch ブロック。no-op 経路の auto-retry は存在しないため、`codex_request_failed` の発生源は committed-fix 後の Phase 4 のみに集約されている。
+検知ロジック: `src/main-post-fix.ts` の Phase 4 にある `postCodexReviewRequest` catch ブロック（+ ACK 無応答時の降格）。加えて ES-496 の escalated-tier 自動リトライ (`attemptMaxTurnsAutoRetry`, opt-in) も、その `@codex review` 再投稿失敗 / Codex 無 ACK 時に同じ `codex_request_failed` へ降格する。ただしこの経路は **repair commit を伴わない** (working tree は revert 済み) 点が Phase 4 と異なる — 停止コメントも「commit は無い」旨を明示する。復旧はどちらも `/restart-review` (soft) で、`iterationCount` / `findingsHashHistory` は保持される (auto-retry 経路は `rollbackFixingClaim` で base iteration を巻き戻し済み)。
 
 `/restart-review` 経由でも発火しうる: `handleRestartCommand` の第 1 書き込み (`status: waiting_codex` 確定) 直後に `@codex review` の再投稿が失敗した場合、同じ `codex_request_failed` stop reason で降格し top-level 停止コメントが投稿される。`addRestartReaction` / 「🟢 LoopPilot restarted」audit comment は付かない (restart 自体が成立していないため)。復旧手順は post-fix 経由の場合と同じ — Codex 認証 / 接続を直してから `/restart-review` (soft / hard どちらでも) で再開する。
 

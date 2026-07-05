@@ -3065,15 +3065,26 @@ describe("runPostFix — ES-496 max_turns escalated auto-retry", () => {
     expect(deps.postCodexReviewRequest).toHaveBeenCalledTimes(1);
     expect(deps.postComment).toHaveBeenCalled();
     const auditBody = vi.mocked(deps.postComment).mock.calls[0]?.[3] as string;
+    // The operator-facing content that matters: why @codex review reappeared
+    // without /restart-review, and which tier the retry uses.
     expect(auditBody).toContain("auto-retry");
+    expect(auditBody).toContain("/restart-review");
+    expect(auditBody).toContain(baseConfig.claudeCodeModelEscalated);
     expect(deps.postStopComment).not.toHaveBeenCalled();
 
-    // waiting_codex preserving stopReason, with the base iteration rolled back.
+    // waiting_codex preserving stopReason, with the base iteration rolled back
+    // and the re-review request id persisted.
     const waiting = findWrite(deps, (s) => s.status === "waiting_codex");
     expect(waiting).toBeDefined();
     expect(waiting?.stopReason).toBe("max_turns_exceeded");
     expect(waiting?.iterationCount).toBe(1);
     expect(waiting?.findingsHashHistory).toHaveLength(1);
+    expect(
+      findWrite(
+        deps,
+        (s) => s.status === "waiting_codex" && s.lastCodexRequestCommentId === 22,
+      ),
+    ).toBeDefined();
     // Never wrote a stopped state.
     expect(findWrite(deps, (s) => s.status === "stopped")).toBeUndefined();
   });
