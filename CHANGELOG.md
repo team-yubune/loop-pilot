@@ -10,6 +10,8 @@ freeze. See [docs/operations/releasing.md](docs/operations/releasing.md).
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-07-06
+
 ### Fixed
 - Pre-fix no longer declares the loop `done` when a `pull_request_review`
   trigger comes from a duplicate or superseded Codex review whose reviewed
