@@ -22323,27 +22323,14 @@ var defaultDeps3 = {
     ], token);
     return stdout.trim();
   },
-  fetchLatestBotReviewCommit: async (owner, repo, pr, botLogin, token) => {
+  fetchReviewCommitById: async (owner, repo, pr, reviewId, token) => {
     const out = await ghApi([
       "api",
-      "--paginate",
-      `repos/${owner}/${repo}/pulls/${pr}/reviews?per_page=100`,
+      `repos/${owner}/${repo}/pulls/${pr}/reviews/${reviewId}`,
       "--jq",
-      // login can only contain [A-Za-z0-9-]; the "|" delimiter never collides
-      // with it, submitted_at, or the 40-char commit_id.
-      '.[] | .user.login + "|" + (.submitted_at // "") + "|" + (.commit_id // "")'
+      ".commit_id // empty"
     ], token);
-    let latest = null;
-    for (const line of out.split("\n").map((s) => s.trim()).filter(Boolean)) {
-      const [login, submittedAt, commitId] = line.split("|");
-      if (login !== botLogin || !commitId || !submittedAt)
-        continue;
-      const submittedMs = new Date(submittedAt).getTime();
-      if (latest === null || submittedMs > latest.submittedAt) {
-        latest = { submittedAt: submittedMs, commitId };
-      }
-    }
-    return latest?.commitId ?? null;
+    return out.trim() || null;
   }
 };
 async function runPreFix(config, deps = defaultDeps3) {
@@ -22630,16 +22617,18 @@ async function runPreFix(config, deps = defaultDeps3) {
     currentIterationFindingCommentIds: []
   };
   if (findings.length === 0) {
-    const headSha2 = deps.readHeadSha();
-    let latestReviewCommit = null;
-    try {
-      latestReviewCommit = await deps.fetchLatestBotReviewCommit(config.repoOwner, config.repoName, config.prNumber, config.codexBotLogin, config.githubToken);
-    } catch (error2) {
-      deps.warning(`[pre-fix] Could not fetch the latest Codex review commit for the HEAD-match guard: ${error2 instanceof Error ? error2.message : String(error2)}. Proceeding to evaluate done.`);
-    }
-    if (headSha2 !== "" && latestReviewCommit !== null && latestReviewCommit !== headSha2) {
-      deps.info(`[pre-fix] No new findings, but the latest Codex review (${latestReviewCommit.slice(0, 8)}) predates HEAD (${headSha2.slice(0, 8)}). A fix was pushed and Codex has not re-reviewed HEAD yet \u2014 skipping instead of marking done (ES-506).`);
-      return;
+    if (currentTriggerSource === "review" && triggerCommentId !== 0) {
+      const headSha2 = deps.readHeadSha();
+      let reviewedCommit = null;
+      try {
+        reviewedCommit = await deps.fetchReviewCommitById(config.repoOwner, config.repoName, config.prNumber, triggerCommentId, config.githubToken);
+      } catch (error2) {
+        deps.warning(`[pre-fix] Could not fetch the triggering review's commit for the HEAD-match guard: ${error2 instanceof Error ? error2.message : String(error2)}. Proceeding to evaluate done.`);
+      }
+      if (headSha2 !== "" && reviewedCommit !== null && reviewedCommit !== headSha2) {
+        deps.info(`[pre-fix] No new findings, but the triggering Codex review reviewed ${reviewedCommit.slice(0, 8)}, not HEAD (${headSha2.slice(0, 8)}). A fix was pushed and Codex has not re-reviewed HEAD yet \u2014 skipping instead of marking done (ES-506).`);
+        return;
+      }
     }
     deps.info("[pre-fix] No findings. Marking done.");
     const doneState = {
