@@ -90,6 +90,9 @@ function makeDeps(
     fetchPrHeadRepoFullName: vi
       .fn()
       .mockResolvedValue("edereship/loop-pilot"),
+    // ES-506: default to "Codex reviewed the current HEAD" so the no-findings
+    // path reaches `done` in the happy case. readHeadSha returns "deadbeef".
+    fetchLatestBotReviewCommit: vi.fn().mockResolvedValue("deadbeef"),
     outputs,
   };
 }
@@ -457,6 +460,116 @@ describe("runPreFix", () => {
     );
     expect(deps.postCompletionComment).toHaveBeenCalled();
     expect(deps.mergeIfChecksPass).not.toHaveBeenCalled();
+  });
+
+  it("ES-506: does NOT mark done when the latest Codex review predates HEAD (superseded/duplicate review)", async () => {
+    // Reproduces the premature-done race: a concurrent run already consumed the
+    // findings, pushed a fix (HEAD is now "fixsha1"), and requested a fresh
+    // @codex review that has not arrived. This serialized run sees 0 new
+    // findings, but Codex's latest review reviewed the pre-fix commit
+    // ("oldsha0"), NOT HEAD. Marking done here would swallow the genuine HEAD
+    // re-review as `Status is 'done'. Skipping.`.
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T11:00:00Z",
+        state: makeState({ status: "waiting_codex" }),
+      },
+      [], // no new findings
+    );
+    deps.readHeadSha = () => "fixsha1";
+    deps.fetchLatestBotReviewCommit = vi.fn().mockResolvedValue("oldsha0");
+
+    await runPreFix(baseConfig, deps);
+
+    // Must skip, not mark done: no `done` state write, no completion comment.
+    expect(deps.outputs.should_run).toBe("false");
+    const doneWrite = vi
+      .mocked(deps.updateStateComment)
+      .mock.calls.find((c) => c[3]?.status === "done");
+    expect(doneWrite).toBeUndefined();
+    expect(deps.postCompletionComment).not.toHaveBeenCalled();
+  });
+
+  it("ES-506: marks done when the latest Codex review commit matches HEAD", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T11:00:00Z",
+        state: makeState({ status: "waiting_codex" }),
+      },
+      [],
+    );
+    deps.readHeadSha = () => "headsha";
+    deps.fetchLatestBotReviewCommit = vi.fn().mockResolvedValue("headsha");
+
+    await runPreFix(baseConfig, deps);
+
+    expect(deps.updateStateComment).toHaveBeenCalledWith(
+      "edereship",
+      "loop-pilot",
+      100,
+      expect.objectContaining({ status: "done", stopReason: "no_findings" }),
+      "github-token",
+      expect.any(Object),
+    );
+    expect(deps.postCompletionComment).toHaveBeenCalled();
+  });
+
+  it("ES-506: fails open (marks done) when the review-commit lookup throws", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T11:00:00Z",
+        state: makeState({ status: "waiting_codex" }),
+      },
+      [],
+    );
+    deps.readHeadSha = () => "headsha";
+    deps.fetchLatestBotReviewCommit = vi
+      .fn()
+      .mockRejectedValue(new Error("api down"));
+
+    await runPreFix(baseConfig, deps);
+
+    expect(deps.warning).toHaveBeenCalled();
+    expect(deps.updateStateComment).toHaveBeenCalledWith(
+      "edereship",
+      "loop-pilot",
+      100,
+      expect.objectContaining({ status: "done", stopReason: "no_findings" }),
+      "github-token",
+      expect.any(Object),
+    );
+  });
+
+  it("ES-506: fails open (marks done) when the bot has no reviews (null commit)", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T11:00:00Z",
+        state: makeState({ status: "waiting_codex" }),
+      },
+      [],
+    );
+    deps.readHeadSha = () => "headsha";
+    deps.fetchLatestBotReviewCommit = vi.fn().mockResolvedValue(null);
+
+    await runPreFix(baseConfig, deps);
+
+    expect(deps.postCompletionComment).toHaveBeenCalled();
+    const doneWrite = vi
+      .mocked(deps.updateStateComment)
+      .mock.calls.find((c) => c[3]?.status === "done");
+    expect(doneWrite).toBeDefined();
   });
 
   it("second-truncates the now() fallback for lastCodexReviewReceivedAt (TY-359 / #150)", async () => {

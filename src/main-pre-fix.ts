@@ -145,6 +145,22 @@ export interface PreFixDeps {
     pr: number,
     token: string,
   ) => Promise<string>;
+  /**
+   * ES-506: returns the commit SHA (`commit_id`) of the most recent review
+   * submitted by `botLogin` on the PR, or `null` when the bot has no reviews,
+   * the field is absent, or the lookup fails. Used by the done-branch HEAD-match
+   * guard to confirm Codex actually reviewed the current HEAD before the loop is
+   * marked `done`. A duplicate / superseded review that predates a just-pushed
+   * fix reviews an older commit, so its `commit_id !== HEAD` — the guard skips
+   * (leaving `waiting_codex`) instead of prematurely declaring the loop clean.
+   */
+  fetchLatestBotReviewCommit: (
+    owner: string,
+    repo: string,
+    pr: number,
+    botLogin: string,
+    token: string,
+  ) => Promise<string | null>;
 }
 
 const defaultDeps: PreFixDeps = {
@@ -183,6 +199,39 @@ const defaultDeps: PreFixDeps = {
       token,
     );
     return stdout.trim();
+  },
+  fetchLatestBotReviewCommit: async (owner, repo, pr, botLogin, token) => {
+    // The reviews endpoint carries `commit_id` + `submitted_at` on every review
+    // — including clean, no-inline-comment reviews — so it (unlike inline review
+    // comments) can answer "did the bot review the current HEAD?" for a done
+    // verdict. No `since` filter exists; we fetch login/submitted_at/commit_id
+    // and pick the newest bot review in JS. `submitted_at` is second-precision,
+    // so we Date-compare rather than sort lexicographically (see codex-ack.ts).
+    const out = await ghApi(
+      [
+        "api",
+        "--paginate",
+        `repos/${owner}/${repo}/pulls/${pr}/reviews?per_page=100`,
+        "--jq",
+        // login can only contain [A-Za-z0-9-]; the "|" delimiter never collides
+        // with it, submitted_at, or the 40-char commit_id.
+        '.[] | .user.login + "|" + (.submitted_at // "") + "|" + (.commit_id // "")',
+      ],
+      token,
+    );
+    let latest: { submittedAt: number; commitId: string } | null = null;
+    for (const line of out.split("\n").map((s) => s.trim()).filter(Boolean)) {
+      const [login, submittedAt, commitId] = line.split("|");
+      // Skip unsubmitted (pending/draft) reviews: an empty submitted_at parses
+      // to NaN, and NaN comparisons are always false — a NaN-timestamped entry
+      // landing first would then never be replaced by a real, newer review.
+      if (login !== botLogin || !commitId || !submittedAt) continue;
+      const submittedMs = new Date(submittedAt).getTime();
+      if (latest === null || submittedMs > latest.submittedAt) {
+        latest = { submittedAt: submittedMs, commitId };
+      }
+    }
+    return latest?.commitId ?? null;
   },
 };
 
@@ -793,6 +842,44 @@ export async function runPreFix(config: Config, deps: PreFixDeps = defaultDeps):
   };
 
   if (findings.length === 0) {
+    // ES-506: HEAD-match guard. A duplicate / superseded Codex review can drive
+    // a serialized pre-fix run whose findings collapse to 0 — the real findings
+    // were already consumed and fixed by the concurrent run that pushed the
+    // current HEAD and requested a fresh `@codex review` that has not arrived
+    // yet. Marking done here declares the loop clean *before Codex has reviewed
+    // HEAD*, and the genuine HEAD re-review that arrives later is then swallowed
+    // by the `Status is 'done'. Skipping.` guard. Only mark done when Codex's
+    // latest review actually covers HEAD; otherwise skip (leave `waiting_codex`)
+    // so the pending HEAD re-review is processed as a normal trigger.
+    //
+    // Fail-open: when HEAD or the review commit cannot be determined (empty sha,
+    // no bot reviews, or a lookup error), fall through to the pre-ES-506 done
+    // behaviour rather than risk a never-done loop on a transient API blip.
+    const headSha = deps.readHeadSha();
+    let latestReviewCommit: string | null = null;
+    try {
+      latestReviewCommit = await deps.fetchLatestBotReviewCommit(
+        config.repoOwner,
+        config.repoName,
+        config.prNumber,
+        config.codexBotLogin,
+        config.githubToken,
+      );
+    } catch (error) {
+      deps.warning(
+        `[pre-fix] Could not fetch the latest Codex review commit for the HEAD-match guard: ${error instanceof Error ? error.message : String(error)}. Proceeding to evaluate done.`,
+      );
+    }
+    if (
+      headSha !== "" &&
+      latestReviewCommit !== null &&
+      latestReviewCommit !== headSha
+    ) {
+      deps.info(
+        `[pre-fix] No new findings, but the latest Codex review (${latestReviewCommit.slice(0, 8)}) predates HEAD (${headSha.slice(0, 8)}). A fix was pushed and Codex has not re-reviewed HEAD yet — skipping instead of marking done (ES-506).`,
+      );
+      return;
+    }
     deps.info("[pre-fix] No findings. Marking done.");
     const doneState: ReviewState = {
       ...updatedStateBase,

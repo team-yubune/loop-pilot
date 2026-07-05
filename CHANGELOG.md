@@ -10,6 +10,16 @@ freeze. See [docs/operations/releasing.md](docs/operations/releasing.md).
 
 ## [Unreleased]
 
+### Fixed
+- Pre-fix no longer declares the loop `done` on a duplicate or superseded Codex
+  review that reviewed a commit older than the current HEAD. When a concurrent
+  run has already consumed the findings, pushed a fix, and requested a fresh
+  `@codex review` that has not arrived, the serialized run now skips (leaving
+  `waiting_codex`) instead of prematurely marking `done` and swallowing the
+  genuine HEAD re-review. `done` is only written when Codex's latest review
+  covers HEAD; the guard fails open (marks done) when the review commit cannot
+  be determined (ES-506).
+
 ## [1.10.1] - 2026-06-20
 
 ### Changed
