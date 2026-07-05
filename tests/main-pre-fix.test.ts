@@ -632,6 +632,36 @@ describe("runPreFix", () => {
     expect(doneWrite).toBeDefined();
   });
 
+  it("ES-506: marks done on a first-pass clean review (no LoopPilot fix yet, lastClaudeCommitSha null)", async () => {
+    // Before any Claude fix, lastClaudeCommitSha is null, so the guard's
+    // `lastClaudeCommitSha === headSha` precondition is false and a clean review
+    // on the PR head marks done without consulting the review commit.
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T11:00:00Z",
+        state: makeState({
+          status: "waiting_codex",
+          lastClaudeCommitSha: null,
+        }),
+      },
+      [],
+    );
+    deps.readHeadSha = () => "headsha";
+    deps.fetchReviewCommitById = vi.fn().mockResolvedValue("oldsha0");
+
+    await runPreFix(reviewTriggerConfig, deps);
+
+    expect(deps.fetchReviewCommitById).not.toHaveBeenCalled();
+    expect(deps.postCompletionComment).toHaveBeenCalled();
+    const doneWrite = vi
+      .mocked(deps.updateStateComment)
+      .mock.calls.find((c) => c[3]?.status === "done");
+    expect(doneWrite).toBeDefined();
+  });
+
   it("ES-506: marks done (does NOT strand) when HEAD advanced past LoopPilot's fix for an external reason", async () => {
     // Regression guard: Codex reviewed a commit, but HEAD is NOT LoopPilot's own
     // just-pushed fix (lastClaudeCommitSha "loopB" != HEAD "externalC" — e.g. a

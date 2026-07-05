@@ -854,32 +854,32 @@ export async function runPreFix(config: Config, deps: PreFixDeps = defaultDeps):
     // Fail-open: when the review commit cannot be determined (review gone or a
     // lookup error) fall through to done rather than risk a never-done loop on a
     // transient API blip.
-    const headSha = deps.readHeadSha();
-    if (
-      currentTriggerSource === "review" &&
-      triggerCommentId !== 0 &&
-      headSha !== "" &&
-      state.lastClaudeCommitSha === headSha
-    ) {
-      let reviewedCommit: string | null = null;
-      try {
-        reviewedCommit = await deps.fetchReviewCommitById(
-          config.repoOwner,
-          config.repoName,
-          config.prNumber,
-          triggerCommentId,
-          config.githubToken,
-        );
-      } catch (error) {
-        deps.warning(
-          `[pre-fix] Could not fetch the triggering review's commit for the HEAD-match guard: ${error instanceof Error ? error.message : String(error)}. Proceeding to evaluate done.`,
-        );
-      }
-      if (reviewedCommit !== null && reviewedCommit !== headSha) {
-        deps.info(
-          `[pre-fix] No new findings, but the triggering Codex review reviewed ${reviewedCommit.slice(0, 8)}, not HEAD (${headSha.slice(0, 8)}). LoopPilot pushed that fix and Codex has not re-reviewed HEAD yet — skipping instead of marking done (ES-506).`,
-        );
-        return;
+    // `readHeadSha` is read lazily, only for review triggers, so the common
+    // `issue_comment` clean-done path is untouched (no extra git call, no
+    // spurious "Could not read HEAD sha" warning).
+    if (currentTriggerSource === "review" && triggerCommentId !== 0) {
+      const headSha = deps.readHeadSha();
+      if (headSha !== "" && state.lastClaudeCommitSha === headSha) {
+        let reviewedCommit: string | null = null;
+        try {
+          reviewedCommit = await deps.fetchReviewCommitById(
+            config.repoOwner,
+            config.repoName,
+            config.prNumber,
+            triggerCommentId,
+            config.githubToken,
+          );
+        } catch (error) {
+          deps.warning(
+            `[pre-fix] Could not fetch the triggering review's commit for the HEAD-match guard: ${error instanceof Error ? error.message : String(error)}. Proceeding to evaluate done.`,
+          );
+        }
+        if (reviewedCommit !== null && reviewedCommit !== headSha) {
+          deps.info(
+            `[pre-fix] No new findings, but the triggering Codex review reviewed ${reviewedCommit.slice(0, 8)}, not HEAD (${headSha.slice(0, 8)}). LoopPilot pushed that fix and Codex has not re-reviewed HEAD yet — skipping instead of marking done (ES-506).`,
+          );
+          return;
+        }
       }
     }
     deps.info("[pre-fix] No findings. Marking done.");
