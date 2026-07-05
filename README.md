@@ -158,6 +158,7 @@ Set these as GitHub Actions repository variables in the target repository.
 | `CODEX_ACK_TIMEOUT_SECONDS` | `90` | Tune how long LoopPilot waits for Codex to acknowledge an `@codex review` (👀) before re-requesting; `0` disables the ACK watchdog. |
 | `CODEX_ACK_MAX_REPOSTS` | `2` | Tune how many times LoopPilot re-requests `@codex review` when Codex does not respond, before stopping with `codex_request_failed`. |
 | `CLAUDE_CODE_MAX_TURNS` | `40` | Tune the max agent turns per fix attempt, forwarded to claude-code-action's `--max-turns`. |
+| `LOOPPILOT_AUTO_RETRY_ESCALATE` | `false` | Set to `'true'` so a base-tier `max_turns_exceeded` stop retries once at the escalated tier automatically (re-requests `@codex review`), without a manual `/restart-review`. One-shot: an escalated attempt that also exceeds `--max-turns` stops as usual (ES-496). |
 | `LOOPPILOT_SHOW_FULL_OUTPUT` | `false` | Set to `'true'` to print the full Claude Code session log to Actions output. Useful for debugging authentication and runtime errors. On public repositories the log is publicly readable (ES-429). |
 
 All inputs are documented in [loop/action.yml](loop/action.yml) and [init/action.yml](init/action.yml).

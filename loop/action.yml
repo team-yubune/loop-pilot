@@ -89,6 +89,10 @@ inputs:
     description: "TY-334: hard cap on @codex review reposts when no ACK arrives. After this many, post-fix demotes to stopped/codex_request_failed. Default 2, max 3."
     required: false
     default: "2"
+  auto-retry-escalate:
+    description: "ES-496: when 'true', a base-tier max_turns_exceeded stop re-requests @codex review and retries once at the escalated tier without a manual /restart-review (one-shot). Default 'false'."
+    required: false
+    default: "false"
   stabilize-interval-seconds:
     description: "Polling interval (seconds) for comment count stabilization safeguard"
     required: false
@@ -372,3 +376,5 @@ runs:
         codex-ack-timeout-seconds: ${{ inputs.codex-ack-timeout-seconds }}
         codex-ack-poll-interval-seconds: ${{ inputs.codex-ack-poll-interval-seconds }}
         codex-ack-max-reposts: ${{ inputs.codex-ack-max-reposts }}
+        # ES-496: opt-in escalated-tier auto-retry on a base-tier max_turns stop.
+        auto-retry-escalate: ${{ inputs.auto-retry-escalate }}

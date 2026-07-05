@@ -306,6 +306,8 @@ jobs:
           codex-ack-timeout-seconds: ${{ vars.CODEX_ACK_TIMEOUT_SECONDS || '90' }}
           codex-ack-poll-interval-seconds: ${{ vars.CODEX_ACK_POLL_INTERVAL_SECONDS || '15' }}
           codex-ack-max-reposts: ${{ vars.CODEX_ACK_MAX_REPOSTS || '2' }}
+          # ES-496: opt-in escalated-tier auto-retry on a base-tier max_turns stop.
+          auto-retry-escalate: ${{ vars.LOOPPILOT_AUTO_RETRY_ESCALATE || 'false' }}
           stabilize-interval-seconds: ${{ vars.STABILIZE_INTERVAL_SECONDS || '10' }}
           stabilize-count: ${{ vars.STABILIZE_COUNT || '3' }}
           looppilot-label: ${{ vars.LOOPPILOT_LABEL || '' }}

@@ -51,6 +51,7 @@ const baseConfig: Config = {
   autoReviewBlockPaths: "",
   scopeMaxFiles: 0,
   scopeMaxLines: 0,
+  autoRetryEscalateMaxTurns: false,
   codexAckTimeoutSeconds: 90,
   codexAckPollIntervalSeconds: 15,
   codexAckMaxReposts: 2,
@@ -108,6 +109,7 @@ function makeDeps(
     runBuildCommand: vi.fn().mockResolvedValue({ success: true, output: "" }),
     postClaudeCodeActionFixSummary: vi.fn().mockResolvedValue(11),
     postCodexReviewRequest: vi.fn().mockResolvedValue(22),
+    postComment: vi.fn().mockResolvedValue(55),
     ensureCodexAck: vi.fn().mockResolvedValue({
       acked: true,
       reason: "eyes",
@@ -3014,5 +3016,205 @@ describe("decodeLsFilesPath", () => {
     expect(decodeLsFilesPath('"src/foo\\tbar.ts"')).toBe("src/foo\tbar.ts");
     expect(decodeLsFilesPath('"src/foo\\nbar.ts"')).toBe("src/foo\nbar.ts");
     expect(decodeLsFilesPath('"a\\"b.ts"')).toBe('a"b.ts');
+  });
+});
+
+describe("runPostFix — ES-496 max_turns escalated auto-retry", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const retryConfig: Config = { ...baseConfig, autoRetryEscalateMaxTurns: true };
+  const maxTurnsInputs: PostFixInputs = {
+    ...baseInputs,
+    actionOutcome: "failure",
+    actionExecutionFile: "/tmp/execution.json",
+  };
+  // Last iteration ran the base tier → auto-retry is eligible.
+  const baseTierState = () =>
+    makeState({
+      findingsHashHistory: [
+        { iteration: 1, hash: "aaaaaaaaaaaaaaaa", modelTier: "base" },
+        { iteration: 2, hash: "bbbbbbbbbbbbbbbb", modelTier: "base" },
+      ],
+    });
+  const detectsMaxTurns = { readActionExecutionFile: () => "Error: Reached max_turns limit" };
+
+  const findWrite = (deps: PostFixDeps, pred: (s: ReviewState) => boolean) =>
+    vi
+      .mocked(deps.updateStateComment)
+      .mock.calls.map((c) => c[3] as ReviewState)
+      .find(pred);
+
+  it("re-requests @codex review and returns to waiting_codex (no stop) on a base-tier max_turns_exceeded", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: baseTierState(),
+      },
+      detectsMaxTurns,
+    );
+
+    await runPostFix(retryConfig, deps, maxTurnsInputs);
+
+    // Working tree reverted; no stop comment; escalated retry requested.
+    expect(deps.resetCalls).toBe(1);
+    expect(deps.postCodexReviewRequest).toHaveBeenCalledTimes(1);
+    expect(deps.postComment).toHaveBeenCalled();
+    const auditBody = vi.mocked(deps.postComment).mock.calls[0]?.[3] as string;
+    expect(auditBody).toContain("auto-retry");
+    expect(deps.postStopComment).not.toHaveBeenCalled();
+
+    // waiting_codex preserving stopReason, with the base iteration rolled back.
+    const waiting = findWrite(deps, (s) => s.status === "waiting_codex");
+    expect(waiting).toBeDefined();
+    expect(waiting?.stopReason).toBe("max_turns_exceeded");
+    expect(waiting?.iterationCount).toBe(1);
+    expect(waiting?.findingsHashHistory).toHaveLength(1);
+    // Never wrote a stopped state.
+    expect(findWrite(deps, (s) => s.status === "stopped")).toBeUndefined();
+  });
+
+  it("does NOT auto-retry when the last iteration already ran the escalated tier (one-shot)", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: makeState({
+          findingsHashHistory: [
+            { iteration: 1, hash: "aaaaaaaaaaaaaaaa", modelTier: "base" },
+            { iteration: 2, hash: "bbbbbbbbbbbbbbbb", modelTier: "escalated" },
+          ],
+        }),
+      },
+      detectsMaxTurns,
+    );
+
+    await runPostFix(retryConfig, deps, maxTurnsInputs);
+
+    expect(deps.postCodexReviewRequest).not.toHaveBeenCalled();
+    expect(findWrite(deps, (s) => s.status === "stopped" && s.stopReason === "max_turns_exceeded")).toBeDefined();
+  });
+
+  it("does NOT auto-retry when the toggle is off (default)", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: baseTierState(),
+      },
+      detectsMaxTurns,
+    );
+
+    await runPostFix(baseConfig, deps, maxTurnsInputs);
+
+    expect(deps.postCodexReviewRequest).not.toHaveBeenCalled();
+    expect(findWrite(deps, (s) => s.status === "stopped" && s.stopReason === "max_turns_exceeded")).toBeDefined();
+  });
+
+  it("does NOT auto-retry when base and escalated models are identical", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: baseTierState(),
+      },
+      detectsMaxTurns,
+    );
+
+    await runPostFix(
+      { ...retryConfig, claudeCodeModelEscalated: baseConfig.claudeCodeModelBase },
+      deps,
+      maxTurnsInputs,
+    );
+
+    expect(deps.postCodexReviewRequest).not.toHaveBeenCalled();
+    expect(findWrite(deps, (s) => s.status === "stopped" && s.stopReason === "max_turns_exceeded")).toBeDefined();
+  });
+
+  it("does NOT auto-retry a non-max_turns action failure (e.g. action_failure)", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: baseTierState(),
+      },
+      // default readActionExecutionFile returns null → not max_turns
+    );
+
+    await runPostFix(retryConfig, deps, { ...baseInputs, actionOutcome: "failure" });
+
+    expect(deps.postCodexReviewRequest).not.toHaveBeenCalled();
+    expect(findWrite(deps, (s) => s.status === "stopped" && s.stopReason === "action_failure")).toBeDefined();
+  });
+
+  it("demotes to stopped/codex_request_failed when the auto-retry @codex review post fails", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: baseTierState(),
+      },
+      {
+        ...detectsMaxTurns,
+        postCodexReviewRequest: vi.fn().mockRejectedValue(new Error("gh down")),
+      },
+    );
+
+    await runPostFix(retryConfig, deps, maxTurnsInputs);
+
+    expect(findWrite(deps, (s) => s.status === "stopped" && s.stopReason === "codex_request_failed")).toBeDefined();
+    expect(deps.postStopComment).toHaveBeenCalledWith(
+      "edereship",
+      "loop-pilot",
+      99,
+      "codex_request_failed",
+      1234,
+      0,
+      expect.any(String),
+      "github-token",
+      expect.any(Object),
+    );
+  });
+
+  it("demotes to stopped/codex_request_failed when Codex does not ACK the auto-retry", async () => {
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: baseTierState(),
+      },
+      {
+        ...detectsMaxTurns,
+        ensureCodexAck: vi.fn().mockResolvedValue({
+          acked: false,
+          reason: "timeout",
+          reposts: 2,
+          lastCommentId: 77,
+        }),
+      },
+    );
+
+    await runPostFix(retryConfig, deps, maxTurnsInputs);
+
+    expect(deps.postCodexReviewRequest).toHaveBeenCalledTimes(1);
+    const stopped = findWrite(deps, (s) => s.status === "stopped" && s.stopReason === "codex_request_failed");
+    expect(stopped).toBeDefined();
+    expect(stopped?.lastCodexRequestCommentId).toBe(77);
   });
 });

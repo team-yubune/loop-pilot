@@ -89,6 +89,10 @@ inputs:
     description: "TY-334: hard cap on @codex review reposts when no ACK arrives. After this many, post-fix demotes to stopped/codex_request_failed. Default 2, max 3."
     required: false
     default: "2"
+  auto-retry-escalate:
+    description: "ES-496: when 'true', a base-tier max_turns_exceeded stop re-requests @codex review and retries once at the escalated tier without a manual /restart-review (one-shot). Default 'false'."
+    required: false
+    default: "false"
 
 runs:
   using: "node24"

@@ -109,6 +109,16 @@ export interface BaseConfig {
   autoReviewBlockPaths: string;
   scopeMaxFiles: number;
   scopeMaxLines: number;
+  /**
+   * Opt-in auto-retry at the escalated tier after a `max_turns_exceeded` stop
+   * (ES-496). When true, post-fix does not stop on a base-tier
+   * `max_turns_exceeded`: it re-requests `@codex review` and returns to
+   * `waiting_codex` preserving `stopReason: "max_turns_exceeded"`, so the next
+   * pre-fix escalates the tier automatically without a manual `/restart-review`.
+   * One-shot — an escalated-tier iteration that hits `max_turns_exceeded` again
+   * stops as before. Default false.
+   */
+  autoRetryEscalateMaxTurns: boolean;
 }
 
 /**
@@ -415,6 +425,11 @@ function loadBaseConfig(): BaseConfig {
     ),
     scopeMaxFiles: intInput("scope-max-files", "LOOPPILOT_SCOPE_MAX_FILES", 0),
     scopeMaxLines: intInput("scope-max-lines", "LOOPPILOT_SCOPE_MAX_LINES", 0),
+    autoRetryEscalateMaxTurns: boolInput(
+      "auto-retry-escalate",
+      "LOOPPILOT_AUTO_RETRY_ESCALATE",
+      false,
+    ),
   };
 }
 

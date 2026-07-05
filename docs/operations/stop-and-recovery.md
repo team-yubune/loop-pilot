@@ -329,6 +329,7 @@ hard restart。soft restart の操作に加えて、`iterationCount` を `0`、`
 - `fixing` のまま停止している場合: 実行中の Workflow B がないことを確認してから `/restart-review --hard`
 - `codex_usage_limit` で停止した場合: Codex 側の quota がリセットされたタイミングで `/restart-review` (soft)。`iterationCount` は保持される
 - `max_turns_exceeded` で停止した場合: `/restart-review` (soft) で再開する。次 iteration は自動で escalated tier (default Opus) に上がる (`previous_max_turns_exceeded`)。1 回 clean commit に到達すると `stopReason` がクリアされ通常 tiering に戻る (one-shot)
+  - **自動リトライ (opt-in, ES-496)**: Repository variable `LOOPPILOT_AUTO_RETRY_ESCALATE=true` を設定すると、**base tier** の `max_turns_exceeded` では停止せず post-fix がその場で `@codex review` を再投稿し `waiting_codex` (`stopReason: max_turns_exceeded` 保持) に戻す → 次 iteration が自動で escalated tier に上がる (`/restart-review` 不要)。発火時は `🔁 LoopPilot auto-retry` で始まる top-level コメントを投稿する。**one-shot**: escalated tier の iteration が再び `max_turns_exceeded` になった場合 (直前 `findingsHashHistory` entry の `modelTier === "escalated"`)、および `BASE === ESCALATED` (固定モデル運用) の場合は自動リトライせず従来どおり停止する。自動リトライの `@codex review` 投稿失敗 / Codex 無 ACK は `stopped/codex_request_failed` に降格する (commit は無いので `/restart-review` で同じ findings を再評価できる)
 - `workflow_crashed` で停止した場合: `/restart-review` (soft) で再開する。workflow crash 時には `iterationCount` が消費済みなので、connector / runner 側の不安定さが継続する場合は `/restart-review --hard` を検討
 
 ### `state_corrupted` の復旧

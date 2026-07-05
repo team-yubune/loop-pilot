@@ -302,6 +302,7 @@ required checks 下で auto-fix commit に CI を発火させたい場合は、�
 2. **直前 iteration の CHECK_COMMAND が失敗していた** — `state.previousCheckFailure !== null` (post-fix が CHECK_COMMAND 失敗時に保存する tail)
 3. **直前 iteration の findings hash と完全一致** — `findingsHashHistory` の最新 entry が `modelTier: "base"` でかつ今回の hash と等しい場合、`isLoop` は `false` を返してこの iteration を escalated tier で再試行させる (`repeated_finding`)。最新 entry が `modelTier: "escalated"` のときに hash 一致が再発した場合、または「直近より前の」 entry と一致した場合 (oscillation) は `loop_detected` で停止する
 4. **直前 iteration が `max_turns_exceeded` で停止していた** — `state.stopReason === "max_turns_exceeded"` を `previousMaxTurnsExceeded` として `selectModel` に渡し、escalated tier (`previous_max_turns_exceeded`) を選ぶ。`/restart-review` は `stopReason` をクリアせず保持する。次に clean commit (status: waiting_codex 遷移) に到達したタイミングで post-fix が `stopReason: null` に戻すため、escalation は **one-shot** で次 iteration からは通常 tiering に戻る
+   - 既定ではこの escalated tier 再試行に人手の `/restart-review` (soft) が必要。Repository variable `LOOPPILOT_AUTO_RETRY_ESCALATE=true` (ES-496) を設定すると、**base tier** の `max_turns_exceeded` で post-fix が停止せずその場で `@codex review` を再投稿し `waiting_codex` (`stopReason` 保持) に戻すため、`/restart-review` なしでこの条件 4 が次 iteration で発火する。`BASE === ESCALATED` (上位 tier 無し) と、既に escalated tier だった iteration (直前 entry の `modelTier === "escalated"`) では自動リトライしない (= one-shot)。詳細は [stop-and-recovery.md](stop-and-recovery.md) の `max_turns_exceeded` 節を参照
 
 選定ロジックは `src/model-selector.ts` に集約。決定的 (deterministic) で I/O 副作用なし、`tests/model-selector.test.ts` で 4 つの escalation reason を網羅。
 

@@ -10,6 +10,18 @@ freeze. See [docs/operations/releasing.md](docs/operations/releasing.md).
 
 ## [Unreleased]
 
+### Added
+- Opt-in escalated-tier auto-retry on `max_turns_exceeded` (`LOOPPILOT_AUTO_RETRY_ESCALATE`,
+  default `false`). When enabled, a base-tier iteration that stops with
+  `max_turns_exceeded` no longer waits for a manual `/restart-review`: post-fix
+  re-requests `@codex review` and returns to `waiting_codex` preserving the stop
+  reason, so the next pre-fix escalates the model tier automatically. One-shot —
+  an escalated-tier attempt that also exceeds `--max-turns` stops as before — and
+  a no-op when `CLAUDE_CODE_MODEL_BASE === CLAUDE_CODE_MODEL_ESCALATED`. A
+  `🔁 LoopPilot auto-retry` comment records each automatic re-request; a failed
+  re-request / missing Codex ACK degrades to `stopped/codex_request_failed` like
+  the existing re-review path (ES-496).
+
 ## [1.10.2] - 2026-07-06
 
 ### Fixed

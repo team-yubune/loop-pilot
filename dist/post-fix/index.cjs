@@ -19258,7 +19258,8 @@ function loadBaseConfig() {
     severityThreshold: severityThresholdInput("severity-threshold", "LOOPPILOT_SEVERITY_THRESHOLD", DEFAULT_SEVERITY_THRESHOLD),
     autoReviewBlockPaths: input("looppilot-block-paths", "LOOPPILOT_BLOCK_PATHS", ""),
     scopeMaxFiles: intInput("scope-max-files", "LOOPPILOT_SCOPE_MAX_FILES", 0),
-    scopeMaxLines: intInput("scope-max-lines", "LOOPPILOT_SCOPE_MAX_LINES", 0)
+    scopeMaxLines: intInput("scope-max-lines", "LOOPPILOT_SCOPE_MAX_LINES", 0),
+    autoRetryEscalateMaxTurns: boolInput("auto-retry-escalate", "LOOPPILOT_AUTO_RETRY_ESCALATE", false)
   };
 }
 function severityThresholdInput(inputName, envName, defaultValue) {
@@ -21452,6 +21453,7 @@ var defaultDeps4 = {
   runBuildCommand,
   postClaudeCodeActionFixSummary,
   postCodexReviewRequest,
+  postComment,
   ensureCodexAck: (params) => ensureCodexAck(params),
   resolveFindingThreads,
   postStopComment,
@@ -21716,6 +21718,99 @@ async function runPostFix(config, deps = defaultDeps4, inputs = readPostFixInput
       await deps.postStopComment(config.repoOwner, config.repoName, config.prNumber, opts.stopReason, inputs.triggerCommentId, opts.remainingFindings ?? 0, opts.detail, config.githubToken, progress);
     }
   }
+  async function attemptMaxTurnsAutoRetry() {
+    if (!config.autoRetryEscalateMaxTurns)
+      return false;
+    if (config.claudeCodeModelBase === config.claudeCodeModelEscalated) {
+      deps.info("[post-fix] auto-retry-escalate: base and escalated models are identical; not auto-retrying max_turns_exceeded.");
+      return false;
+    }
+    const lastTier = state.findingsHashHistory.at(-1)?.modelTier ?? "escalated";
+    if (lastTier !== "base") {
+      deps.info(`[post-fix] auto-retry-escalate: previous iteration tier=${lastTier}; one-shot exhausted, stopping on max_turns_exceeded.`);
+      return false;
+    }
+    deps.info("[post-fix] auto-retry-escalate: base-tier max_turns_exceeded \u2014 re-requesting @codex review to retry once at the escalated tier (no /restart-review).");
+    const retryState = {
+      ...state,
+      ...rollbackFixingClaim(state),
+      status: "waiting_codex",
+      stopReason: "max_turns_exceeded",
+      fixingStartedAt: null,
+      currentIterationFindingCommentIds: []
+    };
+    if (!await updateStateCommentLocked(retryState, "Could not record waiting_codex for the max_turns auto-retry.")) {
+      return true;
+    }
+    try {
+      await deps.postComment(config.repoOwner, config.repoName, config.prNumber, `\u{1F501} LoopPilot auto-retry: the base-tier repair hit \`--max-turns\`. Re-requesting \`@codex review\` and retrying once at the escalated tier (\`${config.claudeCodeModelEscalated}\`) \u2014 no \`/restart-review\` needed. If the escalated attempt also exceeds \`--max-turns\`, the loop stops for manual follow-up.`, config.githubToken);
+    } catch (commentError) {
+      deps.warning(`[post-fix] auto-retry-escalate: failed to post the audit comment (continuing): ${commentError instanceof Error ? commentError.message : String(commentError)}`);
+    }
+    const demoteToCodexRequestFailed = async (baseState, detail) => {
+      const stoppedState = {
+        ...baseState,
+        status: "stopped",
+        stopReason: "codex_request_failed"
+      };
+      if (!await updateStateCommentLocked(stoppedState, "Could not record codex_request_failed after a failed max_turns auto-retry.", {
+        onConflict: async (conflictDetail) => {
+          deps.warning(`[post-fix] ${conflictDetail} State was advanced by a concurrent run; auto-retry demotion skipped.`);
+        }
+      })) {
+        return;
+      }
+      try {
+        await deps.postStopComment(config.repoOwner, config.repoName, config.prNumber, "codex_request_failed", inputs.triggerCommentId, 0, detail, config.githubToken, deriveIterationProgress(stoppedState, config.maxReviewIterations));
+      } catch (notifyError) {
+        deps.warning(`[post-fix] auto-retry-escalate: demoted to codex_request_failed but failed to post the stop notification: ${notifyError instanceof Error ? notifyError.message : String(notifyError)}`);
+      }
+    };
+    deps.info("[post-fix] Posting @codex review request (max_turns auto-retry)...");
+    const codexRequestedAt2 = (/* @__PURE__ */ new Date()).toISOString();
+    let reviewRequestId;
+    try {
+      reviewRequestId = await deps.postCodexReviewRequest(config.repoOwner, config.repoName, config.prNumber, config.codexReviewRequestToken);
+    } catch (error2) {
+      const message = error2 instanceof Error ? error2.message : String(error2);
+      deps.error(`[post-fix] auto-retry-escalate: failed to post @codex review: ${message}. Downgrading to stopped/codex_request_failed.`);
+      await demoteToCodexRequestFailed(retryState, `Failed to post @codex review for the max_turns escalated auto-retry: ${message}`);
+      return true;
+    }
+    const withRequestId = {
+      ...retryState,
+      lastCodexRequestCommentId: reviewRequestId
+    };
+    try {
+      await updateStateCommentLocked(withRequestId, "Could not persist the auto-retry Codex review request comment id.", {
+        onConflict: async (conflictDetail) => {
+          deps.warning(`[post-fix] ${conflictDetail} LoopPilot state remains waiting_codex; the next Codex review trigger will reconcile.`);
+        }
+      });
+    } catch (recordError) {
+      deps.warning(`[post-fix] auto-retry-escalate: failed to persist the review request id (non-conflict error): ${recordError instanceof Error ? recordError.message : String(recordError)}. State remains waiting_codex; the next Codex trigger will reconcile.`);
+      return true;
+    }
+    const ack = await deps.ensureCodexAck({
+      owner: config.repoOwner,
+      repo: config.repoName,
+      pr: config.prNumber,
+      commentId: reviewRequestId,
+      requestedAt: codexRequestedAt2,
+      codexBotLogin: config.codexBotLogin,
+      readToken: config.githubToken,
+      token: config.codexReviewRequestToken,
+      timeoutSeconds: config.codexAckTimeoutSeconds,
+      pollIntervalSeconds: config.codexAckPollIntervalSeconds,
+      maxReposts: config.codexAckMaxReposts
+    });
+    if (!ack.acked) {
+      await demoteToCodexRequestFailed({ ...withRequestId, lastCodexRequestCommentId: ack.lastCommentId }, `Codex did not acknowledge the escalated auto-retry @codex review request after ${config.codexAckMaxReposts} repost(s) (\u2248${config.codexAckTimeoutSeconds}s per attempt). No commit was made; run /restart-review once Codex is reachable to retry at the escalated tier.`);
+      return true;
+    }
+    deps.info(`[post-fix] auto-retry-escalate: state=waiting_codex; escalated retry pending. Review request: ${ack.lastCommentId}`);
+    return true;
+  }
   const outcome = inputs.actionOutcome.toLowerCase();
   if (outcome !== "success") {
     deps.warning(`[post-fix] claude-code-action outcome=${inputs.actionOutcome}. Reverting working tree and stopping.`);
@@ -21735,6 +21830,9 @@ async function runPostFix(config, deps = defaultDeps4, inputs = readPostFixInput
         stopReason = "max_turns_exceeded";
         detail = "claude-code-action exhausted the configured --max-turns budget.";
       }
+    }
+    if (stopReason === "max_turns_exceeded" && await attemptMaxTurnsAutoRetry()) {
+      return;
     }
     await failureExit({
       config,

@@ -19286,7 +19286,8 @@ function loadBaseConfig() {
     severityThreshold: severityThresholdInput("severity-threshold", "LOOPPILOT_SEVERITY_THRESHOLD", DEFAULT_SEVERITY_THRESHOLD),
     autoReviewBlockPaths: input("looppilot-block-paths", "LOOPPILOT_BLOCK_PATHS", ""),
     scopeMaxFiles: intInput("scope-max-files", "LOOPPILOT_SCOPE_MAX_FILES", 0),
-    scopeMaxLines: intInput("scope-max-lines", "LOOPPILOT_SCOPE_MAX_LINES", 0)
+    scopeMaxLines: intInput("scope-max-lines", "LOOPPILOT_SCOPE_MAX_LINES", 0),
+    autoRetryEscalateMaxTurns: boolInput("auto-retry-escalate", "LOOPPILOT_AUTO_RETRY_ESCALATE", false)
   };
 }
 function severityThresholdInput(inputName, envName, defaultValue) {

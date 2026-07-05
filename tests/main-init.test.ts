@@ -39,6 +39,7 @@ const baseConfig: Config = {
   autoReviewBlockPaths: "",
   scopeMaxFiles: 0,
   scopeMaxLines: 0,
+  autoRetryEscalateMaxTurns: false,
   codexAckTimeoutSeconds: 90,
   codexAckPollIntervalSeconds: 15,
   codexAckMaxReposts: 2,
