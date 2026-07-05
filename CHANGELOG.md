@@ -10,6 +10,8 @@ freeze. See [docs/operations/releasing.md](docs/operations/releasing.md).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-07-06
+
 ### Added
 - Opt-in escalated-tier auto-retry on `max_turns_exceeded` (`LOOPPILOT_AUTO_RETRY_ESCALATE`,
   default `false`). When enabled, a base-tier iteration that stops with
