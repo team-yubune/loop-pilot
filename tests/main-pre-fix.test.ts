@@ -484,7 +484,11 @@ describe("runPreFix", () => {
         corrupted: false,
         commentId: 100,
         commentUpdatedAt: "2026-05-14T11:00:00Z",
-        state: makeState({ status: "waiting_codex" }),
+        // HEAD is LoopPilot's own just-pushed fix (a re-review is pending).
+        state: makeState({
+          status: "waiting_codex",
+          lastClaudeCommitSha: "fixsha1",
+        }),
       },
       [], // no new findings
     );
@@ -517,7 +521,10 @@ describe("runPreFix", () => {
         corrupted: false,
         commentId: 100,
         commentUpdatedAt: "2026-05-14T11:00:00Z",
-        state: makeState({ status: "waiting_codex" }),
+        state: makeState({
+          status: "waiting_codex",
+          lastClaudeCommitSha: "headsha",
+        }),
       },
       [],
     );
@@ -574,7 +581,10 @@ describe("runPreFix", () => {
         corrupted: false,
         commentId: 100,
         commentUpdatedAt: "2026-05-14T11:00:00Z",
-        state: makeState({ status: "waiting_codex" }),
+        state: makeState({
+          status: "waiting_codex",
+          lastClaudeCommitSha: "headsha",
+        }),
       },
       [],
     );
@@ -603,7 +613,10 @@ describe("runPreFix", () => {
         corrupted: false,
         commentId: 100,
         commentUpdatedAt: "2026-05-14T11:00:00Z",
-        state: makeState({ status: "waiting_codex" }),
+        state: makeState({
+          status: "waiting_codex",
+          lastClaudeCommitSha: "headsha",
+        }),
       },
       [],
     );
@@ -612,6 +625,39 @@ describe("runPreFix", () => {
 
     await runPreFix(reviewTriggerConfig, deps);
 
+    expect(deps.postCompletionComment).toHaveBeenCalled();
+    const doneWrite = vi
+      .mocked(deps.updateStateComment)
+      .mock.calls.find((c) => c[3]?.status === "done");
+    expect(doneWrite).toBeDefined();
+  });
+
+  it("ES-506: marks done (does NOT strand) when HEAD advanced past LoopPilot's fix for an external reason", async () => {
+    // Regression guard: Codex reviewed a commit, but HEAD is NOT LoopPilot's own
+    // just-pushed fix (lastClaudeCommitSha "loopB" != HEAD "externalC" — e.g. a
+    // human push or a base-branch merge moved HEAD). No fresh @codex review is
+    // necessarily coming, so the guard must NOT skip; marking done preserves the
+    // pre-ES-506 behaviour and avoids a permanent waiting_codex strand. The
+    // review-commit lookup must not even be consulted.
+    const deps = makeDeps(
+      {
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T11:00:00Z",
+        state: makeState({
+          status: "waiting_codex",
+          lastClaudeCommitSha: "loopB",
+        }),
+      },
+      [],
+    );
+    deps.readHeadSha = () => "externalC";
+    deps.fetchReviewCommitById = vi.fn().mockResolvedValue("oldsha0");
+
+    await runPreFix(reviewTriggerConfig, deps);
+
+    expect(deps.fetchReviewCommitById).not.toHaveBeenCalled();
     expect(deps.postCompletionComment).toHaveBeenCalled();
     const doneWrite = vi
       .mocked(deps.updateStateComment)

@@ -12,15 +12,16 @@ freeze. See [docs/operations/releasing.md](docs/operations/releasing.md).
 
 ### Fixed
 - Pre-fix no longer declares the loop `done` when a `pull_request_review`
-  trigger comes from a duplicate or superseded Codex review that reviewed a
-  commit older than the current HEAD. When a concurrent run has already consumed
-  the findings, pushed a fix, and requested a fresh `@codex review` that has not
-  arrived, the serialized run now skips (leaving `waiting_codex`) instead of
+  trigger comes from a duplicate or superseded Codex review whose reviewed
+  `commit_id` is not the current HEAD, *and* that HEAD is LoopPilot's own
+  just-pushed fix (so a fresh `@codex review` of HEAD is already pending). In
+  that case the serialized run now skips (leaving `waiting_codex`) instead of
   prematurely marking `done` and swallowing the genuine HEAD re-review. The
-  guard compares the *triggering* review's `commit_id` to HEAD; it is scoped to
-  review triggers only (Codex's clean verdict arrives as an `issue_comment`
-  without a `commit_id` and still marks done) and fails open when HEAD or the
-  review commit cannot be determined (ES-506).
+  guard is deliberately narrow: it applies only to review triggers (Codex's
+  clean verdict arrives as an `issue_comment` without a `commit_id` and still
+  marks done), only when HEAD equals `lastClaudeCommitSha` (a benign external
+  HEAD advance still marks done, avoiding a permanent `waiting_codex` strand),
+  and it fails open when the review commit cannot be determined (ES-506).
 
 ## [1.10.1] - 2026-06-20
 

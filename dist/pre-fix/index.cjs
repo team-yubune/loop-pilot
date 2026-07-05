@@ -22617,16 +22617,16 @@ async function runPreFix(config, deps = defaultDeps3) {
     currentIterationFindingCommentIds: []
   };
   if (findings.length === 0) {
-    if (currentTriggerSource === "review" && triggerCommentId !== 0) {
-      const headSha2 = deps.readHeadSha();
+    const headSha2 = deps.readHeadSha();
+    if (currentTriggerSource === "review" && triggerCommentId !== 0 && headSha2 !== "" && state.lastClaudeCommitSha === headSha2) {
       let reviewedCommit = null;
       try {
         reviewedCommit = await deps.fetchReviewCommitById(config.repoOwner, config.repoName, config.prNumber, triggerCommentId, config.githubToken);
       } catch (error2) {
         deps.warning(`[pre-fix] Could not fetch the triggering review's commit for the HEAD-match guard: ${error2 instanceof Error ? error2.message : String(error2)}. Proceeding to evaluate done.`);
       }
-      if (headSha2 !== "" && reviewedCommit !== null && reviewedCommit !== headSha2) {
-        deps.info(`[pre-fix] No new findings, but the triggering Codex review reviewed ${reviewedCommit.slice(0, 8)}, not HEAD (${headSha2.slice(0, 8)}). A fix was pushed and Codex has not re-reviewed HEAD yet \u2014 skipping instead of marking done (ES-506).`);
+      if (reviewedCommit !== null && reviewedCommit !== headSha2) {
+        deps.info(`[pre-fix] No new findings, but the triggering Codex review reviewed ${reviewedCommit.slice(0, 8)}, not HEAD (${headSha2.slice(0, 8)}). LoopPilot pushed that fix and Codex has not re-reviewed HEAD yet \u2014 skipping instead of marking done (ES-506).`);
         return;
       }
     }
