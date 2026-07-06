@@ -10,6 +10,8 @@ freeze. See [docs/operations/releasing.md](docs/operations/releasing.md).
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-07-06
+
 ### Fixed
 - Defensive hardening from the ES-420 audit (ES-426):
   - Bot-login matching is now `[bot]`-suffix agnostic across all REST paths
