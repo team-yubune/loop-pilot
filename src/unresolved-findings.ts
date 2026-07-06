@@ -1,5 +1,5 @@
 import { ghApi } from "./gh.js";
-import { botLoginMatches } from "./bot-login.js";
+import { botLoginMatchesGraphql } from "./bot-login.js";
 import { parseGraphqlCommentId } from "./graphql-comment-id.js";
 import { parseSeverity, isAtLeastSeverity } from "./severity-parser.js";
 import type { Finding, Severity } from "./types.js";
@@ -180,13 +180,13 @@ function parsePage(
     if (!firstComment) continue;
     // GraphQL `author.login` omits the `[bot]` suffix that the REST API
     // includes (e.g. "chatgpt-codex-connector" vs "chatgpt-codex-connector[bot]").
-    // `botLoginMatches` compares with the suffix stripped from both sides so the
-    // filter works regardless of which API shape the configured `codexBotLogin`
-    // uses (ES-426 #1 — shared with the REST paths).
+    // `botLoginMatchesGraphql` matches the base name (GraphQL `author.login`
+    // has no `[bot]` suffix for Apps) regardless of which form `codexBotLogin`
+    // uses (ES-426 #1). REST call sites use the suffix-anchored `botLoginMatches`.
     const authorLogin = typeof firstComment.author?.login === "string"
       ? firstComment.author.login
       : "";
-    if (!botLoginMatches(authorLogin, codexBotLogin)) {
+    if (!botLoginMatchesGraphql(authorLogin, codexBotLogin)) {
       skippedNonCodex += 1;
       continue;
     }

@@ -20071,7 +20071,7 @@ var defaultDeps = {
 };
 async function upsertStatusComment(owner, name, pr, update, token, deps = defaultDeps) {
   const MAX_ATTEMPTS = 3;
-  for (let attempt = 1; ; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const existing = await deps.findStatusComment(owner, name, pr, token);
     if (existing === null) {
       const snapshot2 = applyStatusUpdate(createInitialStatusSnapshot(), update);
@@ -20081,16 +20081,18 @@ async function upsertStatusComment(owner, name, pr, update, token, deps = defaul
     const previousSnapshot = parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
     const snapshot = applyStatusUpdate(previousSnapshot, update);
     const body = renderStatusCommentBody(snapshot);
+    const isLastAttempt = attempt === MAX_ATTEMPTS;
     try {
-      await deps.updateStatusComment(owner, name, existing.id, body, token, existing.updatedAt);
+      await deps.updateStatusComment(owner, name, existing.id, body, token, isLastAttempt ? void 0 : existing.updatedAt);
       return existing.id;
     } catch (err) {
-      if (err instanceof StatusCommentConflictError && attempt < MAX_ATTEMPTS) {
+      if (err instanceof StatusCommentConflictError && !isLastAttempt) {
         continue;
       }
       throw err;
     }
   }
+  throw new Error("upsertStatusComment: exhausted retries without resolving");
 }
 
 // dist/comment-poster.js
@@ -20264,8 +20266,13 @@ async function postCodexReviewRequest(owner, name, pr, token) {
 function stripBotSuffix(login) {
   return login.replace(/\[bot\]$/i, "");
 }
+function isBotSuffixed(login) {
+  return /\[bot\]$/i.test(login);
+}
 function botLoginMatches(actual, configured) {
-  return stripBotSuffix(actual) === stripBotSuffix(configured);
+  if (actual === configured)
+    return true;
+  return stripBotSuffix(actual) === stripBotSuffix(configured) && isBotSuffixed(actual);
 }
 
 // dist/codex-ack.js

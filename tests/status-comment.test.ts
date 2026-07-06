@@ -471,19 +471,52 @@ describe("upsertStatusComment", () => {
     expect(updateSpy.mock.calls[1][5]).toBe("T2");
   });
 
-  it("ES-426 #3: re-throws after exhausting retries on a persistent conflict", async () => {
+  it("ES-426 #3: falls back to last-writer-wins (never throws) after exhausting the optimistic-lock retries", async () => {
     findSpy.mockResolvedValue({
       id: 555,
       body: renderStatusCommentBody(snapshot({ entries: [entry({ title: "A" })] })),
       updatedAt: "T1",
     });
-    updateSpy.mockRejectedValue(new StatusCommentConflictError("persistent conflict"));
+    // Realistic stub: the impl only raises a conflict when the optimistic-lock
+    // token (6th arg) is supplied. The final attempt passes undefined → the
+    // unconditional write succeeds.
+    updateSpy.mockImplementation(
+      async (_o, _n, _id, _body, _tok, expectedUpdatedAt?: string) => {
+        if (expectedUpdatedAt !== undefined) {
+          throw new StatusCommentConflictError("conflict");
+        }
+      },
+    );
+
+    const id = await upsertStatusComment(
+      "o",
+      "r",
+      42,
+      { newEntry: entry({ title: "C" }) },
+      "tok",
+      deps,
+    );
+
+    // Never throws on concurrency; resolves via the final unconditional write.
+    expect(id).toBe(555);
+    expect(updateSpy).toHaveBeenCalledTimes(3); // MAX_ATTEMPTS
+    // The final write drops the optimistic-lock token.
+    expect(updateSpy.mock.calls[2][5]).toBeUndefined();
+  });
+
+  it("ES-426 #3: still propagates a non-conflict (network) error", async () => {
+    findSpy.mockResolvedValue({
+      id: 555,
+      body: renderStatusCommentBody(snapshot({ entries: [entry({ title: "A" })] })),
+      updatedAt: "T1",
+    });
+    updateSpy.mockRejectedValue(new Error("network down"));
 
     await expect(
       upsertStatusComment("o", "r", 42, { newEntry: entry({ title: "C" }) }, "tok", deps),
-    ).rejects.toBeInstanceOf(StatusCommentConflictError);
-    // MAX_ATTEMPTS = 3.
-    expect(updateSpy).toHaveBeenCalledTimes(3);
+    ).rejects.toThrow("network down");
+    // A non-conflict error aborts immediately (no retry).
+    expect(updateSpy).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -627,6 +627,33 @@ describe("mergeIfChecksPass — external CI check runs (ES-426 #2)", () => {
     );
   });
 
+  it("keeps the more-blocking entry when the same check differs across head and merge refs (rankCheck)", async () => {
+    // Same external check: green on the head sha, still pending on the merge
+    // ref. The green head entry must NOT mask the pending merge-ref entry, so
+    // the PR does not merge (it times out waiting).
+    const fake = makeDeps({
+      workflowRunPages: [[]],
+      pollIntervalMs: 100,
+      timeoutMs: 250,
+      clockTickMs: 100,
+    });
+    const { log, calls } = captureLog();
+
+    await mergeIfChecksPass("o", "r", 42, "tok", log, {
+      ...fake.deps,
+      getPrMergeSha: async () => "merge456",
+      listCheckRuns: async (_o, _n, sha) =>
+        sha === "merge456"
+          ? [extCheck(null, "in_progress")]
+          : [extCheck("success")],
+    });
+
+    expect(fake.mergeCalls).toBe(0);
+    expect(calls.find((c) => c.level === "warning")?.message).toContain(
+      "pending",
+    );
+  });
+
   it("skips (fail-closed) when the check-runs lookup throws", async () => {
     const fake = makeDeps({ workflowRunPages: [[run(1, "ci", "completed", "success")]] });
     const { log, calls } = captureLog();

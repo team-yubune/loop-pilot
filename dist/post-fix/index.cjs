@@ -19375,6 +19375,20 @@ async function ghApi(args, token, opts = {}) {
     throw new Error(fullMessage);
   }
 }
+async function fetchPrLifecycle(owner, repo, pr, token) {
+  const stdout = await ghApi([
+    "api",
+    `repos/${owner}/${repo}/pulls/${pr}`,
+    "--jq",
+    "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json"
+  ], token);
+  const parsed = JSON.parse(stdout.trim());
+  return {
+    state: typeof parsed.state === "string" ? parsed.state : "",
+    draft: parsed.draft === true,
+    merged: parsed.merged === true
+  };
+}
 
 // dist/claude-code-repair-request.js
 var PREVIOUS_CHECK_FAILURE_MAX_CHARS = 2e4;
@@ -20006,7 +20020,7 @@ var defaultDeps = {
 };
 async function upsertStatusComment(owner, name, pr, update, token, deps = defaultDeps) {
   const MAX_ATTEMPTS = 3;
-  for (let attempt = 1; ; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const existing = await deps.findStatusComment(owner, name, pr, token);
     if (existing === null) {
       const snapshot2 = applyStatusUpdate(createInitialStatusSnapshot(), update);
@@ -20016,16 +20030,18 @@ async function upsertStatusComment(owner, name, pr, update, token, deps = defaul
     const previousSnapshot = parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
     const snapshot = applyStatusUpdate(previousSnapshot, update);
     const body = renderStatusCommentBody(snapshot);
+    const isLastAttempt = attempt === MAX_ATTEMPTS;
     try {
-      await deps.updateStatusComment(owner, name, existing.id, body, token, existing.updatedAt);
+      await deps.updateStatusComment(owner, name, existing.id, body, token, isLastAttempt ? void 0 : existing.updatedAt);
       return existing.id;
     } catch (err) {
-      if (err instanceof StatusCommentConflictError && attempt < MAX_ATTEMPTS) {
+      if (err instanceof StatusCommentConflictError && !isLastAttempt) {
         continue;
       }
       throw err;
     }
   }
+  throw new Error("upsertStatusComment: exhausted retries without resolving");
 }
 
 // dist/comment-poster.js
@@ -21361,8 +21377,13 @@ async function resolveFindingThreads(params, deps = defaultDeps3) {
 function stripBotSuffix(login) {
   return login.replace(/\[bot\]$/i, "");
 }
+function isBotSuffixed(login) {
+  return /\[bot\]$/i.test(login);
+}
 function botLoginMatches(actual, configured) {
-  return stripBotSuffix(actual) === stripBotSuffix(configured);
+  if (actual === configured)
+    return true;
+  return stripBotSuffix(actual) === stripBotSuffix(configured) && isBotSuffixed(actual);
 }
 
 // dist/codex-ack.js
@@ -21522,20 +21543,7 @@ var defaultDeps4 = {
       return null;
     }
   },
-  fetchPrLifecycle: async (owner, repo, pr, token) => {
-    const stdout = await ghApi([
-      "api",
-      `repos/${owner}/${repo}/pulls/${pr}`,
-      "--jq",
-      "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json"
-    ], token);
-    const parsed = JSON.parse(stdout.trim());
-    return {
-      state: typeof parsed.state === "string" ? parsed.state : "",
-      draft: parsed.draft === true,
-      merged: parsed.merged === true
-    };
-  }
+  fetchPrLifecycle: (owner, repo, pr, token) => fetchPrLifecycle(owner, repo, pr, token)
 };
 function countUntrackedAddedLines(content) {
   if (content === "")
@@ -21876,6 +21884,33 @@ async function runPostFix(config, deps = defaultDeps4, inputs = readPostFixInput
     deps.info(`[post-fix] auto-retry-escalate: state=waiting_codex; escalated retry pending. Review request: ${ack.lastCommentId}`);
     return true;
   }
+  try {
+    const lifecycle = await deps.fetchPrLifecycle(config.repoOwner, config.repoName, config.prNumber, config.githubToken);
+    if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
+      const reason = lifecycle.merged ? "merged" : lifecycle.state === "closed" ? "closed" : "a draft";
+      deps.warning(`[post-fix] PR #${config.prNumber} is ${reason}; discarding the uncommitted repair and pausing (no commit / re-review). Resumes on the next Codex review once the PR is open and ready.`);
+      try {
+        deps.resetWorkingTree();
+      } catch (resetError) {
+        deps.error(`[post-fix] Failed to reset working tree after detecting a ${reason} PR: ${resetError instanceof Error ? resetError.message : String(resetError)}`);
+      }
+      const pausedState = {
+        ...state,
+        ...rollbackFixingClaim(state),
+        status: "waiting_codex",
+        fixingStartedAt: null,
+        currentIterationFindingCommentIds: []
+      };
+      await updateStateCommentLocked(pausedState, `Could not pause after detecting a ${reason} PR.`, {
+        onConflict: async (detail) => {
+          deps.warning(`[post-fix] ${detail} State was advanced by a concurrent run; lifecycle pause skipped.`);
+        }
+      });
+      return;
+    }
+  } catch (error2) {
+    deps.warning(`[post-fix] Could not read PR lifecycle state for #${config.prNumber} (${error2 instanceof Error ? error2.message : String(error2)}); proceeding.`);
+  }
   const outcome = inputs.actionOutcome.toLowerCase();
   if (outcome !== "success") {
     deps.warning(`[post-fix] claude-code-action outcome=${inputs.actionOutcome}. Reverting working tree and stopping.`);
@@ -21907,29 +21942,6 @@ async function runPostFix(config, deps = defaultDeps4, inputs = readPostFixInput
       detail
     });
     return;
-  }
-  try {
-    const lifecycle = await deps.fetchPrLifecycle(config.repoOwner, config.repoName, config.prNumber, config.githubToken);
-    if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
-      const reason = lifecycle.merged ? "merged" : lifecycle.state === "closed" ? "closed" : "a draft";
-      deps.warning(`[post-fix] PR #${config.prNumber} is ${reason}; discarding the uncommitted repair and pausing (no commit / re-review). Resumes on the next Codex review once the PR is open and ready.`);
-      try {
-        deps.resetWorkingTree();
-      } catch (resetError) {
-        deps.error(`[post-fix] Failed to reset working tree after detecting a ${reason} PR: ${resetError instanceof Error ? resetError.message : String(resetError)}`);
-      }
-      const pausedState = {
-        ...state,
-        ...rollbackFixingClaim(state),
-        status: "waiting_codex",
-        fixingStartedAt: null,
-        currentIterationFindingCommentIds: []
-      };
-      await updateStateCommentLocked(pausedState, `Could not pause after detecting a ${reason} PR.`);
-      return;
-    }
-  } catch (error2) {
-    deps.warning(`[post-fix] Could not read PR lifecycle state for #${config.prNumber} (${error2 instanceof Error ? error2.message : String(error2)}); proceeding.`);
   }
   let numstat;
   let untrackedRaw;

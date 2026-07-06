@@ -136,8 +136,8 @@ export interface MergerDeps {
   /** Hard budget for the entire wait. Skip + warn after this elapses. */
   timeoutMs: number;
   /**
-   * Minimum wall-clock time that must elapse before treating
-   * `others.length === 0` as "no CI configured" and proceeding to merge.
+   * Minimum wall-clock time that must elapse before treating `!hasCi` (no
+   * workflow runs AND no external check runs) as "no CI configured" and merging.
    * Guards against premature merges in environments where CI registration
    * takes longer than a couple of poll intervals (self-hosted runner
    * cold-start, large `workflow_run` provenance chains, actions/runs API
@@ -264,7 +264,11 @@ function defaultMergerDeps(overrides: Partial<MergerDeps> = {}): MergerDeps {
         [
           "api",
           "--paginate",
-          `/repos/${owner}/${name}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`,
+          // `filter=latest` (the API default, pinned explicitly) returns only
+          // the most recent run per check name, so a stale failed re-run does
+          // not over-block. Relying on the implicit default would silently
+          // change behaviour if GitHub ever flips it to `all`.
+          `/repos/${owner}/${name}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100&filter=latest`,
           "--jq",
           '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, appSlug: (.app.slug // "")}',
         ],
@@ -631,8 +635,7 @@ export async function mergeIfChecksPass(
       // pending list. When every non-self run is complete and green, let the
       // merge win — failures were already rejected at the `failed.length > 0`
       // gate above, and `!mergeShaLookupNull` confirms GitHub settled the merge
-      // ref. The no-CI (`others.length === 0`) case keeps its own dedicated
-      // handling below.
+      // ref. The no-CI (`!hasCi`) case keeps its own dedicated handling below.
       if (hasCi && pending.length === 0 && !mergeShaLookupNull) {
         try {
           await deps.mergeSquash(owner, name, pr, initialHeadSha, token);
@@ -687,7 +690,7 @@ export async function mergeIfChecksPass(
           `[pr-merger] Skipping auto-merge for PR #${pr}: timed out after ${timeoutMinutes} min waiting for the merge commit sha to settle.`,
         );
       } else if (pending.length === 0) {
-        // others.length > 0 and pending is empty, yet the green-merge branch
+        // hasCi is true and pending is empty, yet the green-merge branch
         // above did not fire — so `mergeShaLookupNull` must be true (GitHub has
         // not produced a merge commit sha; the PR is likely unmergeable due to
         // base-branch conflicts). Reporting `timeout_pending` here would emit a
@@ -736,7 +739,7 @@ export async function mergeIfChecksPass(
         return;
       }
     }
-    // others.length === 0 and elapsed < noCiConfiguredDelayMs: CI may not have
+    // !hasCi and elapsed < noCiConfiguredDelayMs: CI may not have
     // been queued yet; fall through to sleep and retry.
 
     pollCount += 1;

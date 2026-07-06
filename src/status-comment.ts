@@ -586,11 +586,15 @@ export async function upsertStatusComment(
   // with the comment's `updated_at` (optimistic lock, same best-effort approach
   // as the state comment) and, on conflict, re-read + re-merge onto the
   // concurrent writer's latest body (applyStatusUpdate prepends our entry, so
-  // both survive). Bounded retry; a persistent conflict is re-thrown for the
-  // caller to log — the concurrent (valid) version is left intact rather than
-  // clobbered.
+  // both survive). The status comment is NOT the source of truth and this call
+  // must stay best-effort — it must never THROW on contention (a throw would
+  // abort a real terminal action, e.g. auto-merge, in an unwrapped caller). So
+  // the final attempt writes unconditionally (last-writer-wins) after a fresh
+  // re-read + re-merge, minimising — though not fully eliminating — history
+  // loss. Non-conflict errors (network / 5xx) still propagate, matching the
+  // pre-ES-426 `ghApi` behaviour.
   const MAX_ATTEMPTS = 3;
-  for (let attempt = 1; ; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const existing = await deps.findStatusComment(owner, name, pr, token);
     if (existing === null) {
       const snapshot = applyStatusUpdate(createInitialStatusSnapshot(), update);
@@ -601,6 +605,10 @@ export async function upsertStatusComment(
       parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
     const snapshot = applyStatusUpdate(previousSnapshot, update);
     const body = renderStatusCommentBody(snapshot);
+    // On the final attempt drop the optimistic lock (undefined skips the
+    // preflight) so a persistent conflict resolves to a last-writer-wins write
+    // instead of throwing.
+    const isLastAttempt = attempt === MAX_ATTEMPTS;
     try {
       await deps.updateStatusComment(
         owner,
@@ -608,14 +616,16 @@ export async function upsertStatusComment(
         existing.id,
         body,
         token,
-        existing.updatedAt,
+        isLastAttempt ? undefined : existing.updatedAt,
       );
       return existing.id;
     } catch (err) {
-      if (err instanceof StatusCommentConflictError && attempt < MAX_ATTEMPTS) {
+      if (err instanceof StatusCommentConflictError && !isLastAttempt) {
         continue; // re-read + re-merge onto the concurrent writer's version
       }
       throw err;
     }
   }
+  // The bounded loop always returns on the final attempt (unconditional write).
+  throw new Error("upsertStatusComment: exhausted retries without resolving");
 }

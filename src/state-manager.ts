@@ -132,9 +132,11 @@ function validateState(obj: unknown): obj is ReviewState {
 
   // Validate nullable fields used in downstream comparisons and Date parsing.
   // ES-426 #4: use Number.isSafeInteger (not `typeof === "number"`) so a
-  // hand-edited state with NaN/Infinity/float cannot slip through — those break
-  // the (id, source) dedup (`NaN === x` is always false), silently re-processing
-  // a legitimate trigger.
+  // hand-edited state with a fractional or out-of-safe-range value (e.g. `1.5`,
+  // `1e308`) cannot slip through. (Literal NaN/Infinity are not JSON-
+  // representable, so JSON.parse rejects those before validateState runs; the
+  // reachable threats are non-integer / out-of-range.) A bad value would break
+  // the (id, source) dedup, silently re-processing a legitimate trigger.
   if (s.lastProcessedReviewId !== null && !Number.isSafeInteger(s.lastProcessedReviewId)) return false;
   // TY-301 #2: lastProcessedTriggerSource was added after the initial release.
   // Tolerate missing and explicit-null shapes; present values must be one of

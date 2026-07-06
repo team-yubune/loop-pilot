@@ -178,6 +178,29 @@ describe("runPreFix", () => {
     },
   );
 
+  it("ES-426 #5: does NOT gate a /restart-review command on a draft PR (command bypasses the lifecycle gate)", async () => {
+    const deps = makeDeps({
+      found: true,
+      corrupted: false,
+      commentId: 100,
+      commentUpdatedAt: "2026-05-14T11:00:00Z",
+      state: makeState({ status: "waiting_codex" }),
+    });
+    // Even a draft PR must not silently drop an explicit command.
+    deps.fetchPrLifecycle = vi
+      .fn()
+      .mockResolvedValue({ state: "open", draft: true, merged: false });
+
+    await runPreFix(
+      { ...baseConfig, triggerCommentBody: "/restart-review" },
+      deps,
+    );
+
+    // The gate is skipped entirely for command triggers; the restart path runs.
+    expect(deps.fetchPrLifecycle).not.toHaveBeenCalled();
+    expect(deps.validateRestartCommand).toHaveBeenCalled();
+  });
+
   it("ES-426 #5: fails open (proceeds) when the PR lifecycle lookup throws", async () => {
     const deps = makeDeps({
       found: true,

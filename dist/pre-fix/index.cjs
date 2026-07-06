@@ -19508,6 +19508,20 @@ async function ghApi(args, token, opts = {}) {
     throw new Error(fullMessage);
   }
 }
+async function fetchPrLifecycle(owner, repo, pr, token) {
+  const stdout = await ghApi([
+    "api",
+    `repos/${owner}/${repo}/pulls/${pr}`,
+    "--jq",
+    "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json"
+  ], token);
+  const parsed = JSON.parse(stdout.trim());
+  return {
+    state: typeof parsed.state === "string" ? parsed.state : "",
+    draft: parsed.draft === true,
+    merged: parsed.merged === true
+  };
+}
 
 // dist/claude-code-repair-request.js
 var PREVIOUS_CHECK_FAILURE_MAX_CHARS = 2e4;
@@ -20361,7 +20375,7 @@ var defaultDeps = {
 };
 async function upsertStatusComment(owner, name, pr, update, token, deps = defaultDeps) {
   const MAX_ATTEMPTS = 3;
-  for (let attempt = 1; ; attempt++) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const existing = await deps.findStatusComment(owner, name, pr, token);
     if (existing === null) {
       const snapshot2 = applyStatusUpdate(createInitialStatusSnapshot(), update);
@@ -20371,16 +20385,18 @@ async function upsertStatusComment(owner, name, pr, update, token, deps = defaul
     const previousSnapshot = parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
     const snapshot = applyStatusUpdate(previousSnapshot, update);
     const body = renderStatusCommentBody(snapshot);
+    const isLastAttempt = attempt === MAX_ATTEMPTS;
     try {
-      await deps.updateStatusComment(owner, name, existing.id, body, token, existing.updatedAt);
+      await deps.updateStatusComment(owner, name, existing.id, body, token, isLastAttempt ? void 0 : existing.updatedAt);
       return existing.id;
     } catch (err) {
-      if (err instanceof StatusCommentConflictError && attempt < MAX_ATTEMPTS) {
+      if (err instanceof StatusCommentConflictError && !isLastAttempt) {
         continue;
       }
       throw err;
     }
   }
+  throw new Error("upsertStatusComment: exhausted retries without resolving");
 }
 
 // dist/comment-poster.js
@@ -20841,8 +20857,16 @@ function checkoutBranch(ref) {
 function stripBotSuffix(login) {
   return login.replace(/\[bot\]$/i, "");
 }
+function isBotSuffixed(login) {
+  return /\[bot\]$/i.test(login);
+}
 function botLoginMatches(actual, configured) {
-  return stripBotSuffix(actual) === stripBotSuffix(configured);
+  if (actual === configured)
+    return true;
+  return stripBotSuffix(actual) === stripBotSuffix(configured) && isBotSuffixed(actual);
+}
+function botLoginMatchesGraphql(actual, configured) {
+  return actual === configured || actual === stripBotSuffix(configured);
 }
 
 // dist/review-collector.js
@@ -21155,7 +21179,11 @@ function defaultMergerDeps(overrides = {}) {
       const stdout = await ghApi([
         "api",
         "--paginate",
-        `/repos/${owner}/${name}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`,
+        // `filter=latest` (the API default, pinned explicitly) returns only
+        // the most recent run per check name, so a stale failed re-run does
+        // not over-block. Relying on the implicit default would silently
+        // change behaviour if GitHub ever flips it to `all`.
+        `/repos/${owner}/${name}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100&filter=latest`,
         "--jq",
         '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, appSlug: (.app.slug // "")}'
       ], token);
@@ -22139,7 +22167,7 @@ function parsePage(stdout, codexBotLogin, severityThreshold) {
     if (!firstComment)
       continue;
     const authorLogin = typeof firstComment.author?.login === "string" ? firstComment.author.login : "";
-    if (!botLoginMatches(authorLogin, codexBotLogin)) {
+    if (!botLoginMatchesGraphql(authorLogin, codexBotLogin)) {
       skippedNonCodex += 1;
       continue;
     }
@@ -22419,20 +22447,7 @@ var defaultDeps3 = {
     ], token);
     return stdout.trim();
   },
-  fetchPrLifecycle: async (owner, repo, pr, token) => {
-    const stdout = await ghApi([
-      "api",
-      `repos/${owner}/${repo}/pulls/${pr}`,
-      "--jq",
-      "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json"
-    ], token);
-    const parsed = JSON.parse(stdout.trim());
-    return {
-      state: typeof parsed.state === "string" ? parsed.state : "",
-      draft: parsed.draft === true,
-      merged: parsed.merged === true
-    };
-  },
+  fetchPrLifecycle: (owner, repo, pr, token) => fetchPrLifecycle(owner, repo, pr, token),
   fetchReviewCommitById: async (owner, repo, pr, reviewId, token) => {
     const out = await ghApi([
       "api",
@@ -22461,17 +22476,19 @@ async function runPreFix(config, deps = defaultDeps3) {
     deps.error(`[pre-fix] Refusing to run: PR #${config.prNumber} head repo ${headRepoFullName === "" ? "(unknown/deleted)" : `"${headRepoFullName}"`} does not match base repo "${expectedRepo}". Auto-fix is disabled for fork PRs. Ensure the workflow's "Check fork PR" guard is present (see docs/operations/security.md).`);
     return;
   }
-  try {
-    const lifecycle = await deps.fetchPrLifecycle(config.repoOwner, config.repoName, config.prNumber, config.githubToken);
-    if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
-      const reason = lifecycle.merged ? "merged" : lifecycle.state === "closed" ? "closed" : "a draft";
-      deps.info(`[pre-fix] PR #${config.prNumber} is ${reason}; skipping the auto-fix loop (no credits spent). It resumes on the next Codex review once the PR is open and ready.`);
-      return;
-    }
-  } catch (error2) {
-    deps.warning(`[pre-fix] Could not read PR lifecycle state for #${config.prNumber} (${error2 instanceof Error ? error2.message : String(error2)}); proceeding.`);
-  }
   const isCommandTrigger = isRestartCommandLike(config.triggerCommentBody);
+  if (!isCommandTrigger) {
+    try {
+      const lifecycle = await deps.fetchPrLifecycle(config.repoOwner, config.repoName, config.prNumber, config.githubToken);
+      if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
+        const reason = lifecycle.merged ? "merged" : lifecycle.state === "closed" ? "closed" : "a draft";
+        deps.info(`[pre-fix] PR #${config.prNumber} is ${reason}; skipping the auto-fix loop (no credits spent). It resumes on the next Codex review once the PR is open and ready.`);
+        return;
+      }
+    } catch (error2) {
+      deps.warning(`[pre-fix] Could not read PR lifecycle state for #${config.prNumber} (${error2 instanceof Error ? error2.message : String(error2)}); proceeding.`);
+    }
+  }
   if (!config.autoReviewFullAuto && !isCommandTrigger) {
     const effectiveLabel = config.autoReviewLabel || DEFAULT_LOOPPILOT_LABEL;
     const labels = await deps.fetchPrLabels(config.repoOwner, config.repoName, config.prNumber, config.githubToken);

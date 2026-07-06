@@ -55,3 +55,36 @@ export async function ghApi(
     throw new Error(fullMessage);
   }
 }
+
+/**
+ * ES-426 #5: reads a PR's lifecycle state (`state` / `draft` / `merged`) from
+ * `GET /repos/{owner}/{repo}/pulls/{pr}`. Shared by pre-fix and post-fix so the
+ * jq + defensive parse live in one place. `.state` is `"open"`/`"closed"`
+ * (draft is the separate `.draft` bool); `.merged` is the terminal bool.
+ */
+export async function fetchPrLifecycle(
+  owner: string,
+  repo: string,
+  pr: number,
+  token: string,
+): Promise<{ state: string; draft: boolean; merged: boolean }> {
+  const stdout = await ghApi(
+    [
+      "api",
+      `repos/${owner}/${repo}/pulls/${pr}`,
+      "--jq",
+      "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json",
+    ],
+    token,
+  );
+  const parsed = JSON.parse(stdout.trim()) as {
+    state?: unknown;
+    draft?: unknown;
+    merged?: unknown;
+  };
+  return {
+    state: typeof parsed.state === "string" ? parsed.state : "",
+    draft: parsed.draft === true,
+    merged: parsed.merged === true,
+  };
+}

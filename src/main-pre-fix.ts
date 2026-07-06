@@ -5,7 +5,7 @@ import {
   type Config,
 } from "./config.js";
 import { runIfNotVitest } from "./entrypoint.js";
-import { ghApi } from "./gh.js";
+import { ghApi, fetchPrLifecycle } from "./gh.js";
 import { demoteFixingOnCrash, rollbackFixingClaim } from "./crash-recovery.js";
 import {
   createInitialState,
@@ -213,27 +213,8 @@ const defaultDeps: PreFixDeps = {
     );
     return stdout.trim();
   },
-  fetchPrLifecycle: async (owner, repo, pr, token) => {
-    const stdout = await ghApi(
-      [
-        "api",
-        `repos/${owner}/${repo}/pulls/${pr}`,
-        "--jq",
-        "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json",
-      ],
-      token,
-    );
-    const parsed = JSON.parse(stdout.trim()) as {
-      state?: unknown;
-      draft?: unknown;
-      merged?: unknown;
-    };
-    return {
-      state: typeof parsed.state === "string" ? parsed.state : "",
-      draft: parsed.draft === true,
-      merged: parsed.merged === true,
-    };
-  },
+  fetchPrLifecycle: (owner, repo, pr, token) =>
+    fetchPrLifecycle(owner, repo, pr, token),
   fetchReviewCommitById: async (owner, repo, pr, reviewId, token) => {
     // Fetch the single triggering review by id; its `commit_id` is the commit
     // Codex actually reviewed. `// empty` yields "" (→ null below) when the
@@ -336,39 +317,45 @@ export async function runPreFix(config: Config, deps: PreFixDeps = defaultDeps):
     return;
   }
 
-  // ─── PR lifecycle gate (ES-426 #5) ───────────────────────────────────────
-  // Skip closed / merged / draft PRs so the loop does not spend model credits
-  // on an iteration that cannot land. Non-destructive: no state is written, so
-  // once the PR is reopened / marked ready, the next Codex review resumes the
-  // loop normally. Fail-open — a lookup error must not wedge a healthy loop.
-  try {
-    const lifecycle = await deps.fetchPrLifecycle(
-      config.repoOwner,
-      config.repoName,
-      config.prNumber,
-      config.githubToken,
-    );
-    if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
-      const reason = lifecycle.merged
-        ? "merged"
-        : lifecycle.state === "closed"
-          ? "closed"
-          : "a draft";
-      deps.info(
-        `[pre-fix] PR #${config.prNumber} is ${reason}; skipping the auto-fix loop (no credits spent). It resumes on the next Codex review once the PR is open and ready.`,
-      );
-      return;
-    }
-  } catch (error) {
-    deps.warning(
-      `[pre-fix] Could not read PR lifecycle state for #${config.prNumber} (${
-        error instanceof Error ? error.message : String(error)
-      }); proceeding.`,
-    );
-  }
-
   // ─── Phase 0: Label gate ──────────────────────────────────────────────────
   const isCommandTrigger = isRestartCommandLike(config.triggerCommentBody);
+
+  // ─── PR lifecycle gate (ES-426 #5) ───────────────────────────────────────
+  // Skip the AUTOMATIC (Codex-triggered) loop on closed / merged / draft PRs so
+  // it does not spend model credits on an iteration that cannot land.
+  // Non-destructive: no state is written, so once the PR is reopened / marked
+  // ready, the next Codex review resumes the loop normally. Scoped to
+  // `!isCommandTrigger` so an explicit `/restart-review` is never silently
+  // dropped (mirrors the label gate below) — a maintainer can still command a
+  // draft/closed PR. Fail-open — a lookup error must not wedge a healthy loop.
+  if (!isCommandTrigger) {
+    try {
+      const lifecycle = await deps.fetchPrLifecycle(
+        config.repoOwner,
+        config.repoName,
+        config.prNumber,
+        config.githubToken,
+      );
+      if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
+        const reason = lifecycle.merged
+          ? "merged"
+          : lifecycle.state === "closed"
+            ? "closed"
+            : "a draft";
+        deps.info(
+          `[pre-fix] PR #${config.prNumber} is ${reason}; skipping the auto-fix loop (no credits spent). It resumes on the next Codex review once the PR is open and ready.`,
+        );
+        return;
+      }
+    } catch (error) {
+      deps.warning(
+        `[pre-fix] Could not read PR lifecycle state for #${config.prNumber} (${
+          error instanceof Error ? error.message : String(error)
+        }); proceeding.`,
+      );
+    }
+  }
+
   if (!config.autoReviewFullAuto && !isCommandTrigger) {
     const effectiveLabel = config.autoReviewLabel || DEFAULT_LOOPPILOT_LABEL;
     const labels = await deps.fetchPrLabels(
