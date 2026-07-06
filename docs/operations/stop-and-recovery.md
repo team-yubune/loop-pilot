@@ -19,7 +19,7 @@ Repository variable `LOOPPILOT_AUTO_MERGE=true` を設定すると、`done / no_
 動作:
 
 1. PR の HEAD sha を取得
-2. その sha に紐づく workflow runs を `GET /repos/.../actions/runs?head_sha=...` で列挙
+2. その sha に紐づく workflow runs を `GET /repos/.../actions/runs?head_sha=...` で列挙。**さらに ES-426 #2 で外部 CI（CircleCI / Jenkins 等、Checks API 経由の GitHub App）を `GET /repos/.../commits/{sha}/check-runs` で列挙し、同じ failure / pending 判定に含める**（`github-actions` app slug の check run は workflow runs 側でカバー済みなので除外 — loop 自身の in-progress job による self-block を避ける）。branch protection の無い repo でも外部 CI 失敗が auto-merge をすり抜けない
 3. 自分自身（`GITHUB_RUN_ID` が一致する loop-pilot run）は除外
 4. 1 つでも `failure` / `cancelled` / `timed_out` / `action_required` / `startup_failure` / `stale` conclusion があれば **マージしない** + warning
 5. すべて `completed` でかつ failure 無しなら `gh pr merge --auto --squash --match-head-commit <verified-sha>` を即発行（GitHub 側でも sha 一致を強制してチェック後の race を防ぐ）
@@ -62,6 +62,10 @@ Repository variable `LOOPPILOT_AUTO_MERGE=true` を設定すると、`done / no_
 | `LOOPPILOT_AUTO_MERGE` | `auto-merge-on-clean` | `false` | 機能の opt-in トグル |
 | `LOOPPILOT_AUTO_MERGE_POLL_SECONDS` | `auto-merge-poll-seconds` | `15` | polling 間隔 |
 | `LOOPPILOT_AUTO_MERGE_TIMEOUT_MINUTES` | `auto-merge-timeout-minutes` | `10` | CI 待ちの上限 |
+
+### PR ライフサイクルによる自動スキップ (ES-426 #5)
+
+PR が **closed / merged / draft** の場合、pre-fix は claude-code-action を起動する前にループをスキップする（モデルクレジットを消費しない）。run 中に PR が closed/merged/draft へ変化した場合は post-fix が未コミットの修正を破棄して pause する（commit / push / 再レビューを行わない）。いずれも**非破壊的**（state は書き換えるが terminal 化しない）で、PR を open / ready に戻せば次の Codex review でループが再開する。ライフサイクル取得に失敗した場合は fail-open（従来どおり続行）。
 
 ### 強制停止
 - iteration_count >= `MAX_REVIEW_ITERATIONS`

@@ -61,6 +61,7 @@ import {
 } from "./check-command-allowlist.js";
 import { selectModel } from "./model-selector.js";
 import { isCodexUsageLimitMessage } from "./codex-status.js";
+import { botLoginMatches } from "./bot-login.js";
 import type { Finding, PrContext, ReviewState } from "./types.js";
 
 /** Pause execution for the given number of milliseconds. */
@@ -162,6 +163,17 @@ export interface PreFixDeps {
     reviewId: number,
     token: string,
   ) => Promise<string | null>;
+  /**
+   * ES-426 #5: reads the PR lifecycle state (`state` / `draft` / `merged`) so
+   * pre-fix can skip a closed / merged / draft PR instead of burning model
+   * credits on an iteration that cannot productively land.
+   */
+  fetchPrLifecycle: (
+    owner: string,
+    repo: string,
+    pr: number,
+    token: string,
+  ) => Promise<{ state: string; draft: boolean; merged: boolean }>;
 }
 
 const defaultDeps: PreFixDeps = {
@@ -200,6 +212,27 @@ const defaultDeps: PreFixDeps = {
       token,
     );
     return stdout.trim();
+  },
+  fetchPrLifecycle: async (owner, repo, pr, token) => {
+    const stdout = await ghApi(
+      [
+        "api",
+        `repos/${owner}/${repo}/pulls/${pr}`,
+        "--jq",
+        "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json",
+      ],
+      token,
+    );
+    const parsed = JSON.parse(stdout.trim()) as {
+      state?: unknown;
+      draft?: unknown;
+      merged?: unknown;
+    };
+    return {
+      state: typeof parsed.state === "string" ? parsed.state : "",
+      draft: parsed.draft === true,
+      merged: parsed.merged === true,
+    };
   },
   fetchReviewCommitById: async (owner, repo, pr, reviewId, token) => {
     // Fetch the single triggering review by id; its `commit_id` is the commit
@@ -301,6 +334,37 @@ export async function runPreFix(config: Config, deps: PreFixDeps = defaultDeps):
         `Ensure the workflow's "Check fork PR" guard is present (see docs/operations/security.md).`,
     );
     return;
+  }
+
+  // ─── PR lifecycle gate (ES-426 #5) ───────────────────────────────────────
+  // Skip closed / merged / draft PRs so the loop does not spend model credits
+  // on an iteration that cannot land. Non-destructive: no state is written, so
+  // once the PR is reopened / marked ready, the next Codex review resumes the
+  // loop normally. Fail-open — a lookup error must not wedge a healthy loop.
+  try {
+    const lifecycle = await deps.fetchPrLifecycle(
+      config.repoOwner,
+      config.repoName,
+      config.prNumber,
+      config.githubToken,
+    );
+    if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
+      const reason = lifecycle.merged
+        ? "merged"
+        : lifecycle.state === "closed"
+          ? "closed"
+          : "a draft";
+      deps.info(
+        `[pre-fix] PR #${config.prNumber} is ${reason}; skipping the auto-fix loop (no credits spent). It resumes on the next Codex review once the PR is open and ready.`,
+      );
+      return;
+    }
+  } catch (error) {
+    deps.warning(
+      `[pre-fix] Could not read PR lifecycle state for #${config.prNumber} (${
+        error instanceof Error ? error.message : String(error)
+      }); proceeding.`,
+    );
   }
 
   // ─── Phase 0: Label gate ──────────────────────────────────────────────────
@@ -646,7 +710,7 @@ export async function runPreFix(config: Config, deps: PreFixDeps = defaultDeps):
   // dedicated reason so PR readers and `/restart-review` users understand
   // the loop did not actually succeed.
   if (
-    config.triggerUserLogin === config.codexBotLogin &&
+    botLoginMatches(config.triggerUserLogin, config.codexBotLogin) &&
     isCodexUsageLimitMessage(config.triggerCommentBody)
   ) {
     deps.info("[pre-fix] Codex usage limit detected in trigger body. Stopping.");
@@ -784,7 +848,7 @@ export async function runPreFix(config: Config, deps: PreFixDeps = defaultDeps):
 
   // ─── Phase 2: Judge ───────────────────────────────────────────────────────
   const latestCommentTime = rawComments
-    .filter((c) => c.user.login === config.codexBotLogin)
+    .filter((c) => botLoginMatches(c.user.login, config.codexBotLogin))
     .reduce(
       (max, c) => (c.createdAt > max ? c.createdAt : max),
       state.lastCodexReviewReceivedAt ?? "",

@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 import { isAtLeastSeverity, parseSeverity } from "./severity-parser.js";
+import { botLoginMatches } from "./bot-login.js";
 import { ghApi } from "./gh.js";
 import type {
   FetchReviewCommentsFn,
@@ -144,7 +145,7 @@ export function filterAndParseComments(
   let threadReplies = 0;
 
   for (const comment of comments) {
-    if (comment.user.login !== botLogin) continue;
+    if (!botLoginMatches(comment.user.login, botLogin)) continue;
     if (lastReceivedAt !== null && !(comment.createdAt > lastReceivedAt)) continue;
     if (comment.inReplyToId != null) {
       threadReplies += 1;
@@ -284,7 +285,7 @@ function countRelevantBotComments(
   threshold: Severity
 ): number {
   return comments.filter((comment) => {
-    if (comment.user.login !== botLogin) return false;
+    if (!botLoginMatches(comment.user.login, botLogin)) return false;
     if (lastReceivedAt !== null && !(comment.createdAt > lastReceivedAt)) return false;
     if (comment.inReplyToId != null) return false;
     const parsed = parseSeverity(comment.body);

@@ -130,8 +130,12 @@ function validateState(obj: unknown): obj is ReviewState {
   if (typeof s.status !== "string" || !VALID_STATUSES.has(s.status)) return false;
   if (!Array.isArray(s.findingsHashHistory)) return false;
 
-  // Validate nullable fields used in downstream comparisons and Date parsing
-  if (s.lastProcessedReviewId !== null && typeof s.lastProcessedReviewId !== "number") return false;
+  // Validate nullable fields used in downstream comparisons and Date parsing.
+  // ES-426 #4: use Number.isSafeInteger (not `typeof === "number"`) so a
+  // hand-edited state with NaN/Infinity/float cannot slip through — those break
+  // the (id, source) dedup (`NaN === x` is always false), silently re-processing
+  // a legitimate trigger.
+  if (s.lastProcessedReviewId !== null && !Number.isSafeInteger(s.lastProcessedReviewId)) return false;
   // TY-301 #2: lastProcessedTriggerSource was added after the initial release.
   // Tolerate missing and explicit-null shapes; present values must be one of
   // the known sources so a forged state cannot smuggle in arbitrary strings
@@ -153,7 +157,8 @@ function validateState(obj: unknown): obj is ReviewState {
   ) {
     return false;
   }
-  if (s.lastCodexRequestCommentId !== null && typeof s.lastCodexRequestCommentId !== "number") return false;
+  // ES-426 #4: Number.isSafeInteger guard (see lastProcessedReviewId above).
+  if (s.lastCodexRequestCommentId !== null && !Number.isSafeInteger(s.lastCodexRequestCommentId)) return false;
   // TY-339 #1 follow-up: bound the length (see TIMESTAMP_MAX_CHARS) so a
   // tampered timestamp cannot break the serializeState step-3 floor guarantee.
   if (
@@ -232,8 +237,11 @@ function validateState(obj: unknown): obj is ReviewState {
     const e = entry as Record<string, unknown>;
     // TY-339 #1: bound `hash` length (16 hex in normal use) so a tampered
     // history entry cannot break the serializeState step-3 floor guarantee.
+    // ES-426 #4: Number.isSafeInteger guard for the entry iteration — a NaN/
+    // Infinity here breaks rollbackFixingClaim (lastEntry.iteration === count)
+    // and loop detection.
     if (
-      typeof e.iteration !== "number" ||
+      !Number.isSafeInteger(e.iteration) ||
       typeof e.hash !== "string" ||
       e.hash.length > FINDINGS_HASH_MAX_CHARS
     ) {

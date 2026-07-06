@@ -6,6 +6,7 @@ import {
   parseStatusCommentBody,
   renderStatusCommentBody,
   upsertStatusComment,
+  StatusCommentConflictError,
   type StatusEntry,
   type StatusSnapshot,
   type UpsertStatusCommentDeps,
@@ -405,6 +406,84 @@ describe("upsertStatusComment", () => {
     const body = updateSpy.mock.calls[0][3];
     expect(body).toContain("Iteration 1 — Auto-fix applied");
     expect(body).toContain("History (1 entry)");
+  });
+
+  it("ES-426 #3: passes the read updatedAt as the optimistic-lock token to updateStatusComment", async () => {
+    findSpy.mockResolvedValue({
+      id: 555,
+      body: renderStatusCommentBody(snapshot({ entries: [entry({ title: "A" })] })),
+      updatedAt: "2026-07-06T00:00:00Z",
+    });
+    updateSpy.mockResolvedValue(undefined);
+
+    await upsertStatusComment(
+      "o",
+      "r",
+      42,
+      { newEntry: entry({ title: "B" }) },
+      "tok",
+      deps,
+    );
+
+    expect(updateSpy).toHaveBeenCalledTimes(1);
+    // 6th arg is expectedUpdatedAt.
+    expect(updateSpy.mock.calls[0][5]).toBe("2026-07-06T00:00:00Z");
+  });
+
+  it("ES-426 #3: on a conflict, re-reads and re-merges onto the concurrent writer's body (no history loss)", async () => {
+    // First read: only entry "A" (updatedAt T1). The first PATCH conflicts
+    // because a concurrent run added entry "B" (second read, updatedAt T2).
+    findSpy
+      .mockResolvedValueOnce({
+        id: 555,
+        body: renderStatusCommentBody(snapshot({ entries: [entry({ title: "A" })] })),
+        updatedAt: "T1",
+      })
+      .mockResolvedValueOnce({
+        id: 555,
+        body: renderStatusCommentBody(
+          snapshot({ entries: [entry({ title: "B" }), entry({ title: "A" })] }),
+        ),
+        updatedAt: "T2",
+      });
+    updateSpy
+      .mockRejectedValueOnce(new StatusCommentConflictError("updated_at changed"))
+      .mockResolvedValueOnce(undefined);
+
+    const id = await upsertStatusComment(
+      "o",
+      "r",
+      42,
+      { newEntry: entry({ title: "C" }) },
+      "tok",
+      deps,
+    );
+
+    expect(id).toBe(555);
+    expect(findSpy).toHaveBeenCalledTimes(2);
+    expect(updateSpy).toHaveBeenCalledTimes(2);
+    // The retried body carries our entry C AND both prior entries (A + the
+    // concurrent B), and locks against the latest updatedAt T2.
+    const retriedBody = updateSpy.mock.calls[1][3];
+    expect(retriedBody).toContain("### C");
+    expect(retriedBody).toContain("### B");
+    expect(retriedBody).toContain("### A");
+    expect(updateSpy.mock.calls[1][5]).toBe("T2");
+  });
+
+  it("ES-426 #3: re-throws after exhausting retries on a persistent conflict", async () => {
+    findSpy.mockResolvedValue({
+      id: 555,
+      body: renderStatusCommentBody(snapshot({ entries: [entry({ title: "A" })] })),
+      updatedAt: "T1",
+    });
+    updateSpy.mockRejectedValue(new StatusCommentConflictError("persistent conflict"));
+
+    await expect(
+      upsertStatusComment("o", "r", 42, { newEntry: entry({ title: "C" }) }, "tok", deps),
+    ).rejects.toBeInstanceOf(StatusCommentConflictError);
+    // MAX_ATTEMPTS = 3.
+    expect(updateSpy).toHaveBeenCalledTimes(3);
   });
 });
 

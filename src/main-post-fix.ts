@@ -11,6 +11,7 @@ import {
   updateStateComment as defaultUpdateStateComment,
 } from "./state-manager.js";
 import { createLockedStateUpdater } from "./state-comment-locker.js";
+import { ghApi } from "./gh.js";
 import * as git from "./git.js";
 import { runCheckCommand as defaultRunCheckCommand } from "./check-runner.js";
 import { runBuildCommand as defaultRunBuildCommand } from "./build-runner.js";
@@ -194,6 +195,18 @@ export interface PostFixDeps {
   push: (owner: string, repo: string, ref: string, token: string) => void;
   /** Reads the file at `path` as utf-8. Returns null on failure. */
   readActionExecutionFile: (path: string) => string | null;
+  /**
+   * ES-426 #5: reads the PR lifecycle state (`state` / `draft` / `merged`) so
+   * post-fix can discard the repair and pause instead of committing / pushing /
+   * re-requesting review on a PR that was closed / merged / drafted during the
+   * claude-code-action run.
+   */
+  fetchPrLifecycle: (
+    owner: string,
+    repo: string,
+    pr: number,
+    token: string,
+  ) => Promise<{ state: string; draft: boolean; merged: boolean }>;
 }
 
 const defaultDeps: PostFixDeps = {
@@ -234,6 +247,27 @@ const defaultDeps: PostFixDeps = {
     } catch {
       return null;
     }
+  },
+  fetchPrLifecycle: async (owner, repo, pr, token) => {
+    const stdout = await ghApi(
+      [
+        "api",
+        `repos/${owner}/${repo}/pulls/${pr}`,
+        "--jq",
+        "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json",
+      ],
+      token,
+    );
+    const parsed = JSON.parse(stdout.trim()) as {
+      state?: unknown;
+      draft?: unknown;
+      merged?: unknown;
+    };
+    return {
+      state: typeof parsed.state === "string" ? parsed.state : "",
+      draft: parsed.draft === true,
+      merged: parsed.merged === true,
+    };
   },
 };
 
@@ -1103,6 +1137,59 @@ export async function runPostFix(
       detail,
     });
     return;
+  }
+
+  // ─── PR lifecycle gate (ES-426 #5) ────────────────────────────────────────
+  // The action succeeded, but if the PR was closed / merged / converted to
+  // draft during the run, do not commit / push / re-request review. Discard the
+  // uncommitted repair, roll back the optimistic fixing claim (no iteration
+  // consumed), and pause at waiting_codex — non-destructive, resumes on the next
+  // Codex review once the PR is open and ready. Fail-open on lookup error so a
+  // transient API failure cannot strand a healthy repair.
+  try {
+    const lifecycle = await deps.fetchPrLifecycle(
+      config.repoOwner,
+      config.repoName,
+      config.prNumber,
+      config.githubToken,
+    );
+    if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
+      const reason = lifecycle.merged
+        ? "merged"
+        : lifecycle.state === "closed"
+          ? "closed"
+          : "a draft";
+      deps.warning(
+        `[post-fix] PR #${config.prNumber} is ${reason}; discarding the uncommitted repair and pausing (no commit / re-review). Resumes on the next Codex review once the PR is open and ready.`,
+      );
+      try {
+        deps.resetWorkingTree();
+      } catch (resetError) {
+        deps.error(
+          `[post-fix] Failed to reset working tree after detecting a ${reason} PR: ${
+            resetError instanceof Error ? resetError.message : String(resetError)
+          }`,
+        );
+      }
+      const pausedState: ReviewState = {
+        ...state,
+        ...rollbackFixingClaim(state),
+        status: "waiting_codex",
+        fixingStartedAt: null,
+        currentIterationFindingCommentIds: [],
+      };
+      await updateStateCommentLocked(
+        pausedState,
+        `Could not pause after detecting a ${reason} PR.`,
+      );
+      return;
+    }
+  } catch (error) {
+    deps.warning(
+      `[post-fix] Could not read PR lifecycle state for #${config.prNumber} (${
+        error instanceof Error ? error.message : String(error)
+      }); proceeding.`,
+    );
   }
 
   // ─── Scope check ─────────────────────────────────────────────────────────

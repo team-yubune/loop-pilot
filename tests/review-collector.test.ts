@@ -45,6 +45,18 @@ describe("parseReviewCommentRecord", () => {
 });
 
 describe("filterAndParseComments", () => {
+  it("ES-426 #1: matches the Codex login across a [bot]-suffix mismatch", () => {
+    // REST API returns the login WITH [bot]; operator configured CODEX_BOT_LOGIN
+    // WITHOUT it. Strict equality would drop every finding; botLoginMatches must
+    // still match.
+    const comments: RawReviewComment[] = [
+      makeComment({ id: 1, body: "P1 Missing type", user: { login: "openai-codex[bot]" } }),
+    ];
+    const { findings } = filterAndParseComments(comments, "openai-codex", null, "P2");
+    expect(findings).toHaveLength(1);
+    expect(findings[0].severity).toBe("P1");
+  });
+
   it("extracts P0, P1, and P2 findings from Codex bot comments", () => {
     const comments: RawReviewComment[] = [
       makeComment({ id: 1, body: "P0 Null dereference\n\nFix the null check." }),

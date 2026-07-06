@@ -10,6 +10,31 @@ freeze. See [docs/operations/releasing.md](docs/operations/releasing.md).
 
 ## [Unreleased]
 
+### Fixed
+- Defensive hardening from the ES-420 audit (ES-426):
+  - Bot-login matching is now `[bot]`-suffix agnostic across all REST paths
+    (review collection, Codex ACK, usage-limit detection). Setting
+    `CODEX_BOT_LOGIN` without the `[bot]` suffix no longer silently drops every
+    Codex comment. Shared `botLoginMatches` util (item 1).
+  - Auto-merge now also gates on external CI reported via the Checks API
+    (CircleCI, Jenkins, … as GitHub Apps), not only `/actions/runs`. GitHub
+    Actions check runs are excluded to avoid double-counting / self-blocking.
+    In a repo without branch protection a failing external check no longer
+    slips past auto-merge (item 2).
+  - The status comment upsert is guarded with an optimistic lock (its
+    `updated_at`) and retries with a re-read + re-merge on conflict, so a
+    concurrent writer no longer clobbers history entries (item 3).
+  - Hidden-state validation rejects non-finite / non-integer
+    `lastProcessedReviewId`, `lastCodexRequestCommentId`, and
+    `findingsHashHistory[].iteration` (`Number.isSafeInteger`), so a
+    hand-edited `NaN`/`Infinity` can no longer break dedup / loop detection
+    (item 4).
+  - pre-fix and post-fix skip closed / merged / draft PRs (pre-fix before
+    invoking claude-code-action; post-fix discards the uncommitted repair and
+    pauses), so the loop no longer spends model credits on a PR that cannot
+    land. Non-destructive — resumes on the next Codex review once the PR is
+    open and ready (item 5).
+
 ## [1.11.0] - 2026-07-06
 
 ### Added

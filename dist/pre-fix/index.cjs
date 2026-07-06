@@ -19797,7 +19797,7 @@ function validateState(obj) {
     return false;
   if (!Array.isArray(s.findingsHashHistory))
     return false;
-  if (s.lastProcessedReviewId !== null && typeof s.lastProcessedReviewId !== "number")
+  if (s.lastProcessedReviewId !== null && !Number.isSafeInteger(s.lastProcessedReviewId))
     return false;
   if ("lastProcessedTriggerSource" in s && s.lastProcessedTriggerSource !== null && s.lastProcessedTriggerSource !== "comment" && s.lastProcessedTriggerSource !== "review") {
     return false;
@@ -19805,7 +19805,7 @@ function validateState(obj) {
   if (s.lastClaudeCommitSha !== null && (typeof s.lastClaudeCommitSha !== "string" || s.lastClaudeCommitSha.length > LAST_CLAUDE_COMMIT_SHA_MAX_CHARS)) {
     return false;
   }
-  if (s.lastCodexRequestCommentId !== null && typeof s.lastCodexRequestCommentId !== "number")
+  if (s.lastCodexRequestCommentId !== null && !Number.isSafeInteger(s.lastCodexRequestCommentId))
     return false;
   if (s.lastCodexReviewReceivedAt !== null && (typeof s.lastCodexReviewReceivedAt !== "string" || s.lastCodexReviewReceivedAt.length > TIMESTAMP_MAX_CHARS)) {
     return false;
@@ -19840,7 +19840,7 @@ function validateState(obj) {
     if (typeof entry2 !== "object" || entry2 === null)
       return false;
     const e = entry2;
-    if (typeof e.iteration !== "number" || typeof e.hash !== "string" || e.hash.length > FINDINGS_HASH_MAX_CHARS) {
+    if (!Number.isSafeInteger(e.iteration) || typeof e.hash !== "string" || e.hash.length > FINDINGS_HASH_MAX_CHARS) {
       return false;
     }
     if ("modelTier" in e && e.modelTier !== void 0 && e.modelTier !== "base" && e.modelTier !== "escalated") {
@@ -20277,8 +20277,14 @@ function isStatusCommentRecord(value) {
   if (typeof value !== "object" || value === null)
     return false;
   const v = value;
-  return typeof v.id === "number" && typeof v.body === "string";
+  return typeof v.id === "number" && typeof v.body === "string" && (v.updatedAt === void 0 || typeof v.updatedAt === "string");
 }
+var StatusCommentConflictError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "StatusCommentConflictError";
+  }
+};
 async function findStatusComment(owner, name, pr, token) {
   const authorFilter = buildTrustedAuthorJqFilter(getTrustedStateCommentAuthors());
   const stdout = await ghApi([
@@ -20286,7 +20292,7 @@ async function findStatusComment(owner, name, pr, token) {
     `repos/${owner}/${name}/issues/${pr}/comments`,
     "--paginate",
     "--jq",
-    `.[] | select(${authorFilter}) | select(.body | startswith("${STATUS_COMMENT_OPEN}")) | {id: .id, body: .body} | @json`
+    `.[] | select(${authorFilter}) | select(.body | startswith("${STATUS_COMMENT_OPEN}")) | {id: .id, body: .body, updatedAt: .updated_at} | @json`
   ], token);
   const trimmed = stdout.trim();
   if (!trimmed)
@@ -20324,7 +20330,19 @@ async function createStatusCommentImpl(owner, name, pr, body, token) {
   }
   return id;
 }
-async function updateStatusCommentImpl(owner, name, commentId, body, token) {
+async function updateStatusCommentImpl(owner, name, commentId, body, token, expectedUpdatedAt) {
+  if (expectedUpdatedAt !== void 0) {
+    const stdout = await ghApi([
+      "api",
+      `repos/${owner}/${name}/issues/comments/${commentId}`,
+      "--jq",
+      ".updated_at"
+    ], token);
+    const actual = stdout.trim();
+    if (actual !== expectedUpdatedAt) {
+      throw new StatusCommentConflictError(`Status comment updated_at changed before PATCH (expected ${expectedUpdatedAt}, actual ${actual})`);
+    }
+  }
   await ghApi([
     "api",
     "--method",
@@ -20342,17 +20360,27 @@ var defaultDeps = {
   updateStatusComment: updateStatusCommentImpl
 };
 async function upsertStatusComment(owner, name, pr, update, token, deps = defaultDeps) {
-  const existing = await deps.findStatusComment(owner, name, pr, token);
-  if (existing === null) {
-    const snapshot2 = applyStatusUpdate(createInitialStatusSnapshot(), update);
-    const body2 = renderStatusCommentBody(snapshot2);
-    return deps.createStatusComment(owner, name, pr, body2, token);
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; ; attempt++) {
+    const existing = await deps.findStatusComment(owner, name, pr, token);
+    if (existing === null) {
+      const snapshot2 = applyStatusUpdate(createInitialStatusSnapshot(), update);
+      const body2 = renderStatusCommentBody(snapshot2);
+      return deps.createStatusComment(owner, name, pr, body2, token);
+    }
+    const previousSnapshot = parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
+    const snapshot = applyStatusUpdate(previousSnapshot, update);
+    const body = renderStatusCommentBody(snapshot);
+    try {
+      await deps.updateStatusComment(owner, name, existing.id, body, token, existing.updatedAt);
+      return existing.id;
+    } catch (err) {
+      if (err instanceof StatusCommentConflictError && attempt < MAX_ATTEMPTS) {
+        continue;
+      }
+      throw err;
+    }
   }
-  const previousSnapshot = parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
-  const snapshot = applyStatusUpdate(previousSnapshot, update);
-  const body = renderStatusCommentBody(snapshot);
-  await deps.updateStatusComment(owner, name, existing.id, body, token);
-  return existing.id;
 }
 
 // dist/comment-poster.js
@@ -20809,6 +20837,14 @@ function checkoutBranch(ref) {
   (0, import_node_child_process2.execFileSync)("git", ["checkout", ref], { stdio: "inherit" });
 }
 
+// dist/bot-login.js
+function stripBotSuffix(login) {
+  return login.replace(/\[bot\]$/i, "");
+}
+function botLoginMatches(actual, configured) {
+  return stripBotSuffix(actual) === stripBotSuffix(configured);
+}
+
 // dist/review-collector.js
 async function fetchReviewComments(repoOwner, repoName, prNumber, githubToken) {
   const stdout = await ghApi([
@@ -20866,7 +20902,7 @@ function filterAndParseComments(comments, botLogin, lastReceivedAt, threshold) {
   let belowThreshold = 0;
   let threadReplies = 0;
   for (const comment of comments) {
-    if (comment.user.login !== botLogin)
+    if (!botLoginMatches(comment.user.login, botLogin))
       continue;
     if (lastReceivedAt !== null && !(comment.createdAt > lastReceivedAt))
       continue;
@@ -20942,7 +20978,7 @@ async function stabilizeReviewComments(initialComments, options) {
 }
 function countRelevantBotComments(comments, botLogin, lastReceivedAt, threshold) {
   return comments.filter((comment) => {
-    if (comment.user.login !== botLogin)
+    if (!botLoginMatches(comment.user.login, botLogin))
       return false;
     if (lastReceivedAt !== null && !(comment.createdAt > lastReceivedAt))
       return false;
@@ -21063,6 +21099,13 @@ var FAILED_CONCLUSIONS = /* @__PURE__ */ new Set([
   "startup_failure",
   "stale"
 ]);
+function rankCheck(c) {
+  if (c.conclusion !== null && FAILED_CONCLUSIONS.has(c.conclusion))
+    return 2;
+  if (c.status !== "completed")
+    return 1;
+  return 0;
+}
 var DEFAULT_AUTO_MERGE_POLL_INTERVAL_MS = 15 * 1e3;
 var DEFAULT_AUTO_MERGE_TIMEOUT_MS = 10 * 60 * 1e3;
 var DEFAULT_NO_CI_DELAY_MS = 60 * 1e3;
@@ -21107,6 +21150,27 @@ function defaultMergerDeps(overrides = {}) {
         }
       }
       return runs;
+    },
+    listCheckRuns: async (owner, name, sha, token) => {
+      const stdout = await ghApi([
+        "api",
+        "--paginate",
+        `/repos/${owner}/${name}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`,
+        "--jq",
+        '.check_runs[] | {name: .name, status: .status, conclusion: .conclusion, appSlug: (.app.slug // "")}'
+      ], token);
+      const checks = [];
+      for (const line of stdout.split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed === "")
+          continue;
+        try {
+          checks.push(JSON.parse(trimmed));
+        } catch {
+          throw new Error(`Failed to parse check-run record: ${trimmed}`);
+        }
+      }
+      return checks;
     },
     mergeSquash: async (owner, name, pr, expectedHeadSha, token) => {
       await ghApi([
@@ -21233,6 +21297,31 @@ async function mergeIfChecksPass(owner, name, pr, token, log, overrides = {}) {
           allRuns.push(r);
       }
     }
+    let externalChecks = [];
+    if (deps.listCheckRuns) {
+      try {
+        const headChecks = await deps.listCheckRuns(owner, name, initialHeadSha, token);
+        const mergeChecks = mergeSha ? await deps.listCheckRuns(owner, name, mergeSha, token) : [];
+        const byKey = /* @__PURE__ */ new Map();
+        for (const c of [...headChecks, ...mergeChecks]) {
+          if (c.appSlug === "github-actions")
+            continue;
+          const key = `${c.appSlug}:${c.name}`;
+          const existing = byKey.get(key);
+          if (existing === void 0 || rankCheck(c) > rankCheck(existing)) {
+            byKey.set(key, c);
+          }
+        }
+        externalChecks = Array.from(byKey.values());
+      } catch (err) {
+        await deps.postSkipNotification?.({
+          kind: "transient_error",
+          detail: `failed to list check runs (${errMessage(err)})`
+        });
+        log.warning(`[pr-merger] Skipping auto-merge for PR #${pr}: failed to list check runs (${errMessage(err)}).`);
+        return;
+      }
+    }
     const selfWorkflowId = deps.selfRunId !== "" ? allRuns.find((r) => String(r.id) === deps.selfRunId)?.workflow_id : void 0;
     const others = selfWorkflowId !== void 0 ? allRuns.filter((r) => r.workflow_id !== selfWorkflowId) : deps.selfRunId !== "" && deps.selfWorkflowName !== "" ? (() => {
       const inferredId = allRuns.find((r) => r.name === deps.selfWorkflowName && (deps.selfWorkflowPath === "" || r.path !== void 0 && r.path.replace(/@.*$/, "") === deps.selfWorkflowPath))?.workflow_id;
@@ -21247,7 +21336,11 @@ async function mergeIfChecksPass(owner, name, pr, token, log, overrides = {}) {
       }
     }
     const deduped = Array.from(latestByWorkflowAndEvent.values());
-    const failed = deduped.filter((r) => r.conclusion !== null && FAILED_CONCLUSIONS.has(r.conclusion));
+    const hasCi = deduped.length > 0 || externalChecks.length > 0;
+    const failed = [
+      ...deduped.filter((r) => r.conclusion !== null && FAILED_CONCLUSIONS.has(r.conclusion)),
+      ...externalChecks.filter((c) => c.conclusion !== null && FAILED_CONCLUSIONS.has(c.conclusion))
+    ];
     if (failed.length > 0) {
       const names = failed.map((r) => `${r.name} (${r.conclusion})`).join(", ");
       await deps.postSkipNotification?.({
@@ -21260,11 +21353,14 @@ async function mergeIfChecksPass(owner, name, pr, token, log, overrides = {}) {
       log.warning(`[pr-merger] Skipping auto-merge for PR #${pr}: ${failed.length} CI run(s) failed: ${names}.`);
       return;
     }
-    const pending = deduped.filter((r) => r.status !== "completed");
+    const pending = [
+      ...deduped.filter((r) => r.status !== "completed"),
+      ...externalChecks.filter((c) => c.status !== "completed")
+    ];
     const elapsedMs = deps.now() - startedAt;
     if (elapsedMs >= deps.timeoutMs) {
       const timeoutMinutes = Math.round(deps.timeoutMs / 6e4);
-      if (others.length > 0 && pending.length === 0 && !mergeShaLookupNull) {
+      if (hasCi && pending.length === 0 && !mergeShaLookupNull) {
         try {
           await deps.mergeSquash(owner, name, pr, initialHeadSha, token);
           log.info(`[pr-merger] Auto-merge (squash) succeeded for PR #${pr} at ${initialHeadSha} (all non-self CI green as the ${timeoutMinutes} min timeout elapsed).`);
@@ -21277,7 +21373,7 @@ async function mergeIfChecksPass(owner, name, pr, token, log, overrides = {}) {
         }
         return;
       }
-      if (others.length === 0) {
+      if (!hasCi) {
         if (!mergeShaLookupNull) {
           try {
             await deps.mergeSquash(owner, name, pr, initialHeadSha, token);
@@ -21314,7 +21410,7 @@ async function mergeIfChecksPass(owner, name, pr, token, log, overrides = {}) {
       return;
     }
     if (pending.length === 0 && !mergeShaLookupNull) {
-      const elapsedSufficient = others.length > 0 || elapsedMs >= deps.noCiConfiguredDelayMs;
+      const elapsedSufficient = hasCi || elapsedMs >= deps.noCiConfiguredDelayMs;
       if (elapsedSufficient) {
         try {
           await deps.mergeSquash(owner, name, pr, initialHeadSha, token);
@@ -21330,7 +21426,7 @@ async function mergeIfChecksPass(owner, name, pr, token, log, overrides = {}) {
       }
     }
     pollCount += 1;
-    if (others.length === 0) {
+    if (!hasCi) {
       log.info(`[pr-merger] Waiting for non-self CI runs to appear for PR #${pr} (poll ${pollCount}).`);
     } else {
       const pendingNames = pending.map((r) => r.name).join(", ");
@@ -21404,7 +21500,7 @@ var defaultCodexAckDeps = {
         return false;
       const login = line.slice(0, pipeIdx);
       const createdAt = line.slice(pipeIdx + 1);
-      return login === codexBotLogin && new Date(createdAt).getTime() >= new Date(sinceIso).getTime();
+      return botLoginMatches(login, codexBotLogin) && new Date(createdAt).getTime() >= new Date(sinceIso).getTime();
     })) {
       return true;
     }
@@ -21421,7 +21517,7 @@ var defaultCodexAckDeps = {
         return false;
       const login = line.slice(0, pipeIdx);
       const submittedAt = line.slice(pipeIdx + 1);
-      return login === codexBotLogin && new Date(submittedAt).getTime() >= new Date(sinceIso).getTime();
+      return botLoginMatches(login, codexBotLogin) && new Date(submittedAt).getTime() >= new Date(sinceIso).getTime();
     });
   },
   postCodexReviewRequest,
@@ -21435,7 +21531,7 @@ async function waitForAckWindow(params, deps, commentId, requestedAt, pollInterv
   for (; ; ) {
     try {
       const reactors = await deps.getEyesReactors(params.owner, params.repo, commentId, params.readToken);
-      if (reactors.includes(params.codexBotLogin)) {
+      if (reactors.some((r) => botLoginMatches(r, params.codexBotLogin))) {
         return "eyes";
       }
     } catch (error2) {
@@ -22020,7 +22116,6 @@ function parsePage(stdout, codexBotLogin, severityThreshold) {
     };
   }
   const rawNodes = Array.isArray(threads.nodes) ? threads.nodes : [];
-  const codexLoginBase = codexBotLogin.replace(/\[bot\]$/i, "");
   const findings = [];
   let skippedNonCodex = 0;
   let skippedResolved = 0;
@@ -22044,7 +22139,7 @@ function parsePage(stdout, codexBotLogin, severityThreshold) {
     if (!firstComment)
       continue;
     const authorLogin = typeof firstComment.author?.login === "string" ? firstComment.author.login : "";
-    if (authorLogin !== codexBotLogin && authorLogin !== codexLoginBase) {
+    if (!botLoginMatches(authorLogin, codexBotLogin)) {
       skippedNonCodex += 1;
       continue;
     }
@@ -22324,6 +22419,20 @@ var defaultDeps3 = {
     ], token);
     return stdout.trim();
   },
+  fetchPrLifecycle: async (owner, repo, pr, token) => {
+    const stdout = await ghApi([
+      "api",
+      `repos/${owner}/${repo}/pulls/${pr}`,
+      "--jq",
+      "{state: .state, draft: (.draft // false), merged: (.merged // false)} | @json"
+    ], token);
+    const parsed = JSON.parse(stdout.trim());
+    return {
+      state: typeof parsed.state === "string" ? parsed.state : "",
+      draft: parsed.draft === true,
+      merged: parsed.merged === true
+    };
+  },
   fetchReviewCommitById: async (owner, repo, pr, reviewId, token) => {
     const out = await ghApi([
       "api",
@@ -22351,6 +22460,16 @@ async function runPreFix(config, deps = defaultDeps3) {
   if (headRepoFullName.toLowerCase() !== expectedRepo.toLowerCase()) {
     deps.error(`[pre-fix] Refusing to run: PR #${config.prNumber} head repo ${headRepoFullName === "" ? "(unknown/deleted)" : `"${headRepoFullName}"`} does not match base repo "${expectedRepo}". Auto-fix is disabled for fork PRs. Ensure the workflow's "Check fork PR" guard is present (see docs/operations/security.md).`);
     return;
+  }
+  try {
+    const lifecycle = await deps.fetchPrLifecycle(config.repoOwner, config.repoName, config.prNumber, config.githubToken);
+    if (lifecycle.merged || lifecycle.state === "closed" || lifecycle.draft) {
+      const reason = lifecycle.merged ? "merged" : lifecycle.state === "closed" ? "closed" : "a draft";
+      deps.info(`[pre-fix] PR #${config.prNumber} is ${reason}; skipping the auto-fix loop (no credits spent). It resumes on the next Codex review once the PR is open and ready.`);
+      return;
+    }
+  } catch (error2) {
+    deps.warning(`[pre-fix] Could not read PR lifecycle state for #${config.prNumber} (${error2 instanceof Error ? error2.message : String(error2)}); proceeding.`);
   }
   const isCommandTrigger = isRestartCommandLike(config.triggerCommentBody);
   if (!config.autoReviewFullAuto && !isCommandTrigger) {
@@ -22514,7 +22633,7 @@ async function runPreFix(config, deps = defaultDeps3) {
     deps.info(`[pre-fix] Trigger comment ${triggerCommentId} (source=${currentTriggerSource ?? "unknown"}) already processed. Skipping.`);
     return;
   }
-  if (config.triggerUserLogin === config.codexBotLogin && isCodexUsageLimitMessage(config.triggerCommentBody)) {
+  if (botLoginMatches(config.triggerUserLogin, config.codexBotLogin) && isCodexUsageLimitMessage(config.triggerCommentBody)) {
     deps.info("[pre-fix] Codex usage limit detected in trigger body. Stopping.");
     const stoppedState = {
       ...state,
@@ -22586,7 +22705,7 @@ async function runPreFix(config, deps = defaultDeps3) {
     deps.info(`[review-collector] Skipped ${skipped.threadReplies} thread reply comment(s) (not root findings).`);
   }
   deps.info(`[pre-fix] Found ${findings.length} findings at or above threshold ${config.severityThreshold}.`);
-  const latestCommentTime = rawComments.filter((c) => c.user.login === config.codexBotLogin).reduce((max, c) => c.createdAt > max ? c.createdAt : max, state.lastCodexReviewReceivedAt ?? "");
+  const latestCommentTime = rawComments.filter((c) => botLoginMatches(c.user.login, config.codexBotLogin)).reduce((max, c) => c.createdAt > max ? c.createdAt : max, state.lastCodexReviewReceivedAt ?? "");
   const updatedStateBase = {
     ...state,
     lastProcessedReviewId: triggerCommentId || state.lastProcessedReviewId,

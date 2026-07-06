@@ -289,6 +289,50 @@ describe("deserializeState", () => {
     expect(deserializeState(body)).toBeNull();
   });
 
+  it("ES-426 #4: rejects a non-finite lastProcessedReviewId (Number.isSafeInteger guard)", () => {
+    // A hand-edited state with NaN/Infinity here breaks the (id, source) dedup
+    // (NaN === x is always false) so a legitimate trigger would re-process.
+    const body = serializeState(makeState({ lastProcessedReviewId: 42 })).replace(
+      /"lastProcessedReviewId":\s*\d+/,
+      '"lastProcessedReviewId": 1e308',
+    );
+    expect(deserializeState(body)).toBeNull();
+  });
+
+  it("ES-426 #4: rejects a fractional lastCodexRequestCommentId (Number.isSafeInteger guard)", () => {
+    const body = serializeState(
+      makeState({ lastCodexRequestCommentId: 7 }),
+    ).replace(/"lastCodexRequestCommentId":\s*\d+/, '"lastCodexRequestCommentId": 1.5');
+    expect(deserializeState(body)).toBeNull();
+  });
+
+  it("ES-426 #4: rejects a non-finite findingsHashHistory[].iteration (Number.isSafeInteger guard)", () => {
+    // A NaN/Infinity iteration breaks rollbackFixingClaim (iteration === count)
+    // and loop detection.
+    const body = serializeState(
+      makeState({
+        findingsHashHistory: [{ iteration: 1, hash: "aaaaaaaaaaaaaaaa" }],
+      }),
+    ).replace(/"iteration":\s*\d+/, '"iteration": 1e308');
+    expect(deserializeState(body)).toBeNull();
+  });
+
+  it("ES-426 #4: still accepts valid numeric ids and iterations", () => {
+    const restored = deserializeState(
+      serializeState(
+        makeState({
+          lastProcessedReviewId: 42,
+          lastCodexRequestCommentId: 7,
+          findingsHashHistory: [{ iteration: 1, hash: "aaaaaaaaaaaaaaaa" }],
+        }),
+      ),
+    );
+    expect(restored).not.toBeNull();
+    expect(restored!.lastProcessedReviewId).toBe(42);
+    expect(restored!.lastCodexRequestCommentId).toBe(7);
+    expect(restored!.findingsHashHistory[0].iteration).toBe(1);
+  });
+
   it("rejects an oversized lastClaudeCommitSha (TY-339 #1)", () => {
     // A tampered/legacy state with a giant SHA would otherwise pass validation
     // and defeat the serializeState step-3 floor (which keeps this field).

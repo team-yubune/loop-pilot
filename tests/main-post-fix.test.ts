@@ -156,6 +156,10 @@ function makeDeps(
       counters.pushCalls.push({ owner, repo, ref, token });
     },
     readActionExecutionFile: () => null,
+    // ES-426 #5: default to an open, ready PR so the lifecycle gate is a no-op.
+    fetchPrLifecycle: vi
+      .fn()
+      .mockResolvedValue({ state: "open", draft: false, merged: false }),
     ...overrides,
   };
   // Expose counters as live getters so post-call assertions see the latest
@@ -3227,5 +3231,68 @@ describe("runPostFix — ES-496 max_turns escalated auto-retry", () => {
     const stopped = findWrite(deps, (s) => s.status === "stopped" && s.stopReason === "codex_request_failed");
     expect(stopped).toBeDefined();
     expect(stopped?.lastCodexRequestCommentId).toBe(77);
+  });
+});
+
+describe("runPostFix — ES-426 #5 PR lifecycle gate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    ["merged", { state: "closed", draft: false, merged: true }],
+    ["closed", { state: "closed", draft: false, merged: false }],
+    ["draft", { state: "open", draft: true, merged: false }],
+  ])(
+    "discards the repair and pauses (no commit / push / re-review) when the PR is %s",
+    async (_label, lifecycle) => {
+      const deps = makeDeps({
+        found: true,
+        corrupted: false,
+        commentId: 100,
+        commentUpdatedAt: "2026-05-14T12:00:00Z",
+        state: makeState(),
+      });
+      deps.fetchPrLifecycle = vi.fn().mockResolvedValue(lifecycle);
+
+      await runPostFix(baseConfig, deps, baseInputs);
+
+      expect(deps.resetCalls).toBe(1);
+      expect(deps.commitMessages).toEqual([]);
+      expect(deps.pushCalls).toEqual([]);
+      expect(deps.postCodexReviewRequest).not.toHaveBeenCalled();
+      expect(deps.runCheckCommand).not.toHaveBeenCalled();
+      // Paused at waiting_codex with the optimistic iteration rolled back.
+      expect(deps.updateStateComment).toHaveBeenCalledWith(
+        "edereship",
+        "loop-pilot",
+        100,
+        expect.objectContaining({
+          status: "waiting_codex",
+          iterationCount: 1,
+          findingsHashHistory: [{ iteration: 1, hash: "aaaaaaaaaaaaaaaa" }],
+        }),
+        "github-token",
+        expect.any(Object),
+      );
+    },
+  );
+
+  it("fails open (proceeds to commit) when the PR lifecycle lookup throws", async () => {
+    const deps = makeDeps({
+      found: true,
+      corrupted: false,
+      commentId: 100,
+      commentUpdatedAt: "2026-05-14T12:00:00Z",
+      state: makeState(),
+    });
+    deps.fetchPrLifecycle = vi.fn().mockRejectedValue(new Error("api down"));
+
+    await runPostFix(baseConfig, deps, baseInputs);
+
+    expect(deps.warning).toHaveBeenCalled();
+    // Normal clean-run flow still happens.
+    expect(deps.commitMessages.length).toBe(1);
+    expect(deps.postCodexReviewRequest).toHaveBeenCalled();
   });
 });

@@ -93,6 +93,7 @@ function makeDeps(opts: {
       runsIdx += 1;
       return page;
     },
+    listCheckRuns: async () => [],
     mergeSquash: async (_o, _n, _pr, sha) => {
       record.mergeCalls += 1;
       record.mergeShas.push(sha);
@@ -411,6 +412,7 @@ describe("mergeIfChecksPass — error handling", () => {
         throw new Error("network down");
       },
       listWorkflowRuns: async () => [],
+      listCheckRuns: async () => [],
       mergeSquash: async (_o, _n, _pr, _sha) => {},
       sleep: async () => {},
       now: () => 0,
@@ -433,6 +435,7 @@ describe("mergeIfChecksPass — error handling", () => {
       listWorkflowRuns: async () => {
         throw new Error("rate limit");
       },
+      listCheckRuns: async () => [],
       mergeSquash: async (_o, _n, _pr, _sha) => {},
       sleep: async () => {},
       now: () => 0,
@@ -467,6 +470,7 @@ describe("mergeIfChecksPass — error handling", () => {
     await mergeIfChecksPass("o", "r", 42, "tok", log, {
       getPrHeadSha: async () => "",
       listWorkflowRuns: async () => [],
+      listCheckRuns: async () => [],
       mergeSquash: async (_o, _n, _pr, _sha) => {},
       sleep: async () => {},
       now: () => 0,
@@ -548,6 +552,99 @@ describe("mergeIfChecksPass — no other runs", () => {
   });
 });
 
+describe("mergeIfChecksPass — external CI check runs (ES-426 #2)", () => {
+  const extCheck = (
+    conclusion: string | null,
+    status = "completed",
+    appSlug = "circleci",
+    name = "ci/circleci",
+  ) => ({ name, status, conclusion, appSlug });
+
+  it("skips auto-merge when an external (non-github-actions) check run failed", async () => {
+    const fake = makeDeps({ workflowRunPages: [[]] });
+    const { log, calls } = captureLog();
+
+    await mergeIfChecksPass("o", "r", 42, "tok", log, {
+      ...fake.deps,
+      listCheckRuns: async () => [extCheck("failure")],
+    });
+
+    expect(fake.mergeCalls).toBe(0);
+    expect(calls.find((c) => c.level === "warning")?.message).toContain(
+      "failed",
+    );
+  });
+
+  it("merges when the only CI signal is a green external check", async () => {
+    const fake = makeDeps({ workflowRunPages: [[]] });
+    const { log } = captureLog();
+
+    await mergeIfChecksPass("o", "r", 42, "tok", log, {
+      ...fake.deps,
+      noCiConfiguredDelayMs: 0,
+      listCheckRuns: async () => [extCheck("success")],
+    });
+
+    // hasCi is true (an external check exists) and it is complete + green.
+    expect(fake.mergeCalls).toBe(1);
+  });
+
+  it("ignores github-actions check runs (the loop's own in-progress job must not self-block)", async () => {
+    const fake = makeDeps({ workflowRunPages: [[]] });
+    const { log } = captureLog();
+
+    await mergeIfChecksPass("o", "r", 42, "tok", log, {
+      ...fake.deps,
+      noCiConfiguredDelayMs: 0,
+      // A still-running github-actions check would block forever if counted;
+      // it must be filtered (covered by the self-excluded workflow-runs path).
+      listCheckRuns: async () => [
+        extCheck(null, "in_progress", "github-actions", "loop / loop"),
+      ],
+    });
+
+    // Treated as no CI configured → merges after the (zeroed) no-CI delay.
+    expect(fake.mergeCalls).toBe(1);
+  });
+
+  it("does not merge while an external check is still pending (times out instead)", async () => {
+    const fake = makeDeps({
+      workflowRunPages: [[]],
+      pollIntervalMs: 100,
+      timeoutMs: 250,
+      clockTickMs: 100,
+    });
+    const { log, calls } = captureLog();
+
+    await mergeIfChecksPass("o", "r", 42, "tok", log, {
+      ...fake.deps,
+      listCheckRuns: async () => [extCheck(null, "in_progress")],
+    });
+
+    expect(fake.mergeCalls).toBe(0);
+    expect(calls.find((c) => c.level === "warning")?.message).toContain(
+      "pending",
+    );
+  });
+
+  it("skips (fail-closed) when the check-runs lookup throws", async () => {
+    const fake = makeDeps({ workflowRunPages: [[run(1, "ci", "completed", "success")]] });
+    const { log, calls } = captureLog();
+
+    await mergeIfChecksPass("o", "r", 42, "tok", log, {
+      ...fake.deps,
+      listCheckRuns: async () => {
+        throw new Error("checks api down");
+      },
+    });
+
+    expect(fake.mergeCalls).toBe(0);
+    expect(calls.find((c) => c.level === "warning")?.message).toContain(
+      "check runs",
+    );
+  });
+});
+
 describe("mergeIfChecksPass — no-CI delay (TY-308)", () => {
   it("#A (TY-328): a CI-less repo whose timeout is below the no-CI delay merges at the timeout, not never", async () => {
     // timeoutMs=55s, noCiConfiguredDelayMs=60s: the no-CI fast-path merge gate
@@ -564,6 +661,7 @@ describe("mergeIfChecksPass — no-CI delay (TY-308)", () => {
       getPrHeadSha: async () => "abc123",
       getPrMergeSha: undefined,
       listWorkflowRuns: async () => [run(999, "loop-pilot", "in_progress", null)],
+      listCheckRuns: async () => [],
       mergeSquash: async (_o, _n, _pr, sha) => { mergeCalls += 1; mergeShas.push(sha); },
       sleep: async () => { clock.t += 10_000; },
       now: () => clock.t,
@@ -588,6 +686,7 @@ describe("mergeIfChecksPass — no-CI delay (TY-308)", () => {
       getPrHeadSha: async () => "abc123",
       getPrMergeSha: undefined,
       listWorkflowRuns: async () => [run(999, "loop-pilot", "in_progress", null)],
+      listCheckRuns: async () => [],
       mergeSquash: async (_o, _n, _pr, sha) => { mergeCalls += 1; mergeShas.push(sha); },
       sleep: async () => { clock.t += 60_000; },
       now: () => clock.t,
@@ -611,6 +710,7 @@ describe("mergeIfChecksPass — no-CI delay (TY-308)", () => {
       getPrHeadSha: async () => "abc123",
       getPrMergeSha: undefined,
       listWorkflowRuns: async () => [run(1, "ci", "completed", "success")],
+      listCheckRuns: async () => [],
       mergeSquash: async () => { mergeCalls += 1; },
       sleep: async () => { clock.t += 1000; },
       now: () => clock.t,
@@ -636,6 +736,7 @@ describe("mergeIfChecksPass — no-CI delay (TY-308)", () => {
       getPrHeadSha: async () => "abc123",
       getPrMergeSha: async () => null,
       listWorkflowRuns: async () => [],
+      listCheckRuns: async () => [],
       mergeSquash: async () => { mergeCalls += 1; },
       sleep: async () => { clock.t += 30_000; },
       now: () => clock.t,
@@ -664,6 +765,7 @@ describe("mergeIfChecksPass — getPrMergeSha error handling (Finding 1)", () =>
       getPrHeadSha: async () => "abc123",
       getPrMergeSha: async () => { throw new Error("rate-limit"); },
       listWorkflowRuns: async () => { listCalls += 1; return [run(1, "ci", "completed", "success")]; },
+      listCheckRuns: async () => [],
       mergeSquash: async (_o, _n, _pr, _sha) => {},
       sleep: async () => {},
       now: () => 0,
@@ -705,6 +807,7 @@ describe("mergeIfChecksPass — merge sha pending (Finding 2)", () => {
         if (sha === "merge-sha-xyz") return [run(1, "ci", "completed", "success")];
         return [];
       },
+      listCheckRuns: async () => [],
       mergeSquash: async () => { mergeCalls += 1; },
       sleep: async () => { clock.t += 100; },
       now: () => clock.t,
@@ -743,6 +846,7 @@ describe("mergeIfChecksPass — merge sha pending (Finding 2)", () => {
         if (sha === "merge-sha-xyz") return [run(3, "ci", "completed", "success")];
         return [];
       },
+      listCheckRuns: async () => [],
       mergeSquash: async () => { mergeCalls += 1; },
       sleep: async () => { clock.t += 100; },
       now: () => clock.t,
@@ -964,6 +1068,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
         throw new Error("rate-limit");
       },
       listWorkflowRuns: async () => [],
+      listCheckRuns: async () => [],
       mergeSquash: async () => {},
       sleep: async () => {},
       now: () => 0,
@@ -991,6 +1096,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
     await mergeIfChecksPass("o", "r", 42, "tok", log, {
       getPrHeadSha: async () => "",
       listWorkflowRuns: async () => [],
+      listCheckRuns: async () => [],
       mergeSquash: async () => {},
       sleep: async () => {},
       now: () => 0,
@@ -1020,6 +1126,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
       // Omit getPrMergeSha so the default (which calls `gh`) doesn't fire.
       getPrMergeSha: undefined,
       listWorkflowRuns: async () => [run(1, "ci", "in_progress", null)],
+      listCheckRuns: async () => [],
       mergeSquash: async () => {},
       sleep: async () => {},
       now: () => 0,
@@ -1049,6 +1156,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
       },
       getPrMergeSha: undefined,
       listWorkflowRuns: async () => [run(1, "ci", "in_progress", null)],
+      listCheckRuns: async () => [],
       mergeSquash: async () => {},
       sleep: async () => {},
       now: () => 0,
@@ -1074,6 +1182,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
       listWorkflowRuns: async () => {
         throw new Error("rate-limit");
       },
+      listCheckRuns: async () => [],
       mergeSquash: async () => {},
       sleep: async () => {},
       now: () => 0,
@@ -1101,6 +1210,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
         throw new Error("rate-limit");
       },
       listWorkflowRuns: async () => [run(1, "ci", "completed", "success")],
+      listCheckRuns: async () => [],
       mergeSquash: async () => {},
       sleep: async () => {},
       now: () => 0,
@@ -1133,6 +1243,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
         if (listCalls === 1) return [run(1, "ci", "completed", "success")];
         throw new Error("rate-limit");
       },
+      listCheckRuns: async () => [],
       mergeSquash: async () => {},
       sleep: async () => {},
       now: () => 0,
@@ -1268,6 +1379,7 @@ describe("mergeIfChecksPass — postSkipNotification on every skip path (TY-295)
       getPrMergeSha: async () => null,
       listWorkflowRuns: async (_o, _n, sha) =>
         sha === "abc123" ? [run(1, "ci", "completed", "success")] : [],
+      listCheckRuns: async () => [],
       mergeSquash: async () => {
         throw new Error("merge must not be attempted when the merge sha is unsettled");
       },

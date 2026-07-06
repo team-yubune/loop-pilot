@@ -1,5 +1,6 @@
 import * as core from "@actions/core";
 import { ghApi } from "./gh.js";
+import { botLoginMatches } from "./bot-login.js";
 import { postCodexReviewRequest as defaultPostCodexReviewRequest } from "./comment-poster.js";
 
 /**
@@ -140,7 +141,7 @@ export const defaultCodexAckDeps: CodexAckDeps = {
           // Date-compare (not lexicographic) for the same second/millisecond
           // precision reason documented on the reviews path below.
           return (
-            login === codexBotLogin &&
+            botLoginMatches(login, codexBotLogin) &&
             new Date(createdAt).getTime() >= new Date(sinceIso).getTime()
           );
         })
@@ -176,7 +177,7 @@ export const defaultCodexAckDeps: CodexAckDeps = {
         // a lexicographic compare would incorrectly treat 43.000s as newer
         // than 43.500s (ASCII 'Z' > '.').
         return (
-          login === codexBotLogin &&
+          botLoginMatches(login, codexBotLogin) &&
           new Date(submittedAt).getTime() >= new Date(sinceIso).getTime()
         );
       });
@@ -210,7 +211,7 @@ async function waitForAckWindow(
         commentId,
         params.readToken,
       );
-      if (reactors.includes(params.codexBotLogin)) {
+      if (reactors.some((r) => botLoginMatches(r, params.codexBotLogin))) {
         return "eyes";
       }
     } catch (error) {

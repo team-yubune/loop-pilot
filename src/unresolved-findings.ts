@@ -1,4 +1,5 @@
 import { ghApi } from "./gh.js";
+import { botLoginMatches } from "./bot-login.js";
 import { parseGraphqlCommentId } from "./graphql-comment-id.js";
 import { parseSeverity, isAtLeastSeverity } from "./severity-parser.js";
 import type { Finding, Severity } from "./types.js";
@@ -148,7 +149,6 @@ function parsePage(
   }
 
   const rawNodes = Array.isArray(threads.nodes) ? threads.nodes : [];
-  const codexLoginBase = codexBotLogin.replace(/\[bot\]$/i, "");
   const findings: Finding[] = [];
   let skippedNonCodex = 0;
   let skippedResolved = 0;
@@ -180,12 +180,13 @@ function parsePage(
     if (!firstComment) continue;
     // GraphQL `author.login` omits the `[bot]` suffix that the REST API
     // includes (e.g. "chatgpt-codex-connector" vs "chatgpt-codex-connector[bot]").
-    // Match either form so the filter works regardless of which API shape
-    // the configured `codexBotLogin` uses.
+    // `botLoginMatches` compares with the suffix stripped from both sides so the
+    // filter works regardless of which API shape the configured `codexBotLogin`
+    // uses (ES-426 #1 — shared with the REST paths).
     const authorLogin = typeof firstComment.author?.login === "string"
       ? firstComment.author.login
       : "";
-    if (authorLogin !== codexBotLogin && authorLogin !== codexLoginBase) {
+    if (!botLoginMatches(authorLogin, codexBotLogin)) {
       skippedNonCodex += 1;
       continue;
     }

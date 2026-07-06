@@ -390,12 +390,34 @@ export function applyStatusUpdate(
 interface StatusCommentRecord {
   id: number;
   body: string;
+  /**
+   * ES-426 #3: the comment's `updated_at`, used as the optimistic-lock token by
+   * `upsertStatusComment`. Optional so hand-built dep stubs that omit it simply
+   * skip the preflight compare (last-writer-wins, the pre-ES-426 behaviour).
+   */
+  updatedAt?: string;
 }
 
 function isStatusCommentRecord(value: unknown): value is StatusCommentRecord {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.id === "number" && typeof v.body === "string";
+  return (
+    typeof v.id === "number" &&
+    typeof v.body === "string" &&
+    (v.updatedAt === undefined || typeof v.updatedAt === "string")
+  );
+}
+
+/**
+ * ES-426 #3: raised when the status comment's `updated_at` changed between the
+ * read and the PATCH, i.e. a concurrent writer slipped in. `upsertStatusComment`
+ * catches it to re-read + re-merge so history entries are not clobbered.
+ */
+export class StatusCommentConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StatusCommentConflictError";
+  }
 }
 
 /**
@@ -420,7 +442,7 @@ export async function findStatusComment(
       `repos/${owner}/${name}/issues/${pr}/comments`,
       "--paginate",
       "--jq",
-      `.[] | select(${authorFilter}) | select(.body | startswith("${STATUS_COMMENT_OPEN}")) | {id: .id, body: .body} | @json`,
+      `.[] | select(${authorFilter}) | select(.body | startswith("${STATUS_COMMENT_OPEN}")) | {id: .id, body: .body, updatedAt: .updated_at} | @json`,
     ],
     token,
   );
@@ -480,7 +502,30 @@ async function updateStatusCommentImpl(
   commentId: number,
   body: string,
   token: string,
+  expectedUpdatedAt?: string,
 ): Promise<void> {
+  // ES-426 #3: preflight GET compares `updated_at` before the PATCH so a
+  // concurrent writer that slipped in since the read is detected (GitHub's
+  // issue-comment PATCH does not honour conditional requests reliably — see the
+  // note in state-manager.patchStateComment — so this preflight is the same
+  // best-effort compare the state comment uses). undefined skips the check.
+  if (expectedUpdatedAt !== undefined) {
+    const stdout = await ghApi(
+      [
+        "api",
+        `repos/${owner}/${name}/issues/comments/${commentId}`,
+        "--jq",
+        ".updated_at",
+      ],
+      token,
+    );
+    const actual = stdout.trim();
+    if (actual !== expectedUpdatedAt) {
+      throw new StatusCommentConflictError(
+        `Status comment updated_at changed before PATCH (expected ${expectedUpdatedAt}, actual ${actual})`,
+      );
+    }
+  }
   await ghApi(
     [
       "api",
@@ -511,6 +556,7 @@ export interface UpsertStatusCommentDeps {
     commentId: number,
     body: string,
     token: string,
+    expectedUpdatedAt?: string,
   ) => Promise<void>;
 }
 
@@ -534,16 +580,42 @@ export async function upsertStatusComment(
   token: string,
   deps: UpsertStatusCommentDeps = defaultDeps,
 ): Promise<number> {
-  const existing = await deps.findStatusComment(owner, name, pr, token);
-  if (existing === null) {
-    const snapshot = applyStatusUpdate(createInitialStatusSnapshot(), update);
+  // ES-426 #3: read → merge → PATCH is a read-modify-write on a comment that is
+  // NOT the source of truth, so a concurrent writer between the read and the
+  // PATCH would silently drop the other run's history entry. Guard the write
+  // with the comment's `updated_at` (optimistic lock, same best-effort approach
+  // as the state comment) and, on conflict, re-read + re-merge onto the
+  // concurrent writer's latest body (applyStatusUpdate prepends our entry, so
+  // both survive). Bounded retry; a persistent conflict is re-thrown for the
+  // caller to log — the concurrent (valid) version is left intact rather than
+  // clobbered.
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; ; attempt++) {
+    const existing = await deps.findStatusComment(owner, name, pr, token);
+    if (existing === null) {
+      const snapshot = applyStatusUpdate(createInitialStatusSnapshot(), update);
+      const body = renderStatusCommentBody(snapshot);
+      return deps.createStatusComment(owner, name, pr, body, token);
+    }
+    const previousSnapshot =
+      parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
+    const snapshot = applyStatusUpdate(previousSnapshot, update);
     const body = renderStatusCommentBody(snapshot);
-    return deps.createStatusComment(owner, name, pr, body, token);
+    try {
+      await deps.updateStatusComment(
+        owner,
+        name,
+        existing.id,
+        body,
+        token,
+        existing.updatedAt,
+      );
+      return existing.id;
+    } catch (err) {
+      if (err instanceof StatusCommentConflictError && attempt < MAX_ATTEMPTS) {
+        continue; // re-read + re-merge onto the concurrent writer's version
+      }
+      throw err;
+    }
   }
-  const previousSnapshot =
-    parseStatusCommentBody(existing.body) ?? createInitialStatusSnapshot();
-  const snapshot = applyStatusUpdate(previousSnapshot, update);
-  const body = renderStatusCommentBody(snapshot);
-  await deps.updateStatusComment(owner, name, existing.id, body, token);
-  return existing.id;
 }
